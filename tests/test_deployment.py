@@ -310,3 +310,20 @@ def test_runtime_browser_installer_repairs_missing_build_artifact(monkeypatch, t
     command, options = install_calls[0]
     assert command == [installer["sys"].executable, "-m", "playwright", "install", "--only-shell", "chromium"]
     assert Path(options["env"]["PLAYWRIGHT_BROWSERS_PATH"]) == webwatch.PLAYWRIGHT_BROWSERS_DIR.resolve()
+
+
+def test_voroa_docker_image_installs_linux_dependencies_in_the_runtime_image():
+    repository = Path(__file__).parents[1]
+    dockerfile = (repository / "Dockerfile").read_text(encoding="utf-8")
+    dockerignore = (repository / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    assert dockerfile.count("\nFROM ") == 0 and dockerfile.startswith("FROM python:3.14.6-slim\n")
+    assert "PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers" in dockerfile
+    assert "RUN python tools/install_playwright_browser.py" in dockerfile
+    assert dockerfile.index("RUN python tools/install_playwright_browser.py") < dockerfile.index("USER webwatch")
+    assert "--bind 0.0.0.0:${PORT:-3000}" in dockerfile
+    assert "HEALTHCHECK --interval=30s" in dockerfile
+    assert "/auth/status" in dockerfile and "authentication_available" in dockerfile
+    assert ".playwright-browsers" in dockerignore
+    assert ".env" in dockerignore
+    assert "*.sqlite3" in dockerignore

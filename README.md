@@ -43,21 +43,18 @@ Never place secrets in source control or browser code. The demo credentials are 
 
 ## Voroa deployment
 
-Voroa installs `requirements.txt` before its custom build command. Set these in the Voroa dashboard:
+Playwright needs Linux shared libraries as well as its browser binary. The current automatically detected Python service installs packages in its build command, but Voroa documents Docker as the deployment mode for OS packages and runs the image built from the Dockerfile. The missing `libglib-2.0.so.0` means the build-installed libraries did not reach the Python runtime environment. See [Voroa's Docker deployment guide](https://getvoroa.com/docs/docker/) and [Playwright's browser dependency instructions](https://playwright.dev/python/docs/browsers).
 
-**Build command**
+Deploy WebWatch as a Docker runtime service so Playwright's browser and OS libraries are built into the same final image:
 
-```sh
-pip install -r requirements.txt && python tools/install_playwright_browser.py
-```
+1. Create a new Voroa web service connected to this repository and `master`.
+2. Choose **Docker** as the runtime and use `/Dockerfile` as the Dockerfile path.
+3. The Dockerfile installs Python dependencies, runs `tools/install_playwright_browser.py` (including Playwright's Linux OS dependencies), verifies the exact headless shell, and starts Gunicorn on Voroa's `PORT`. For Docker services, Voroa uses the Dockerfile's `CMD`; its dashboard Start Command field does not override it.
+4. Add the service's runtime environment variables in Voroa. Do not pass secrets as Docker build arguments.
 
-**Start command**
+Voroa says a service's runtime cannot be changed after it is created. The existing Python-runtime service therefore needs a new Docker-runtime service. Keep the old service until the new one is verified and its environment is copied. The current `/tmp/webwatch.sqlite3` database is ephemeral and is not transferred to a new service; preserve or migrate any data separately before retiring the old service. Do not reuse a database file from the Docker build context.
 
-```sh
-python tools/install_playwright_browser.py --runtime && python -m gunicorn --config gunicorn.conf.py --bind 0.0.0.0:$PORT app:app
-```
-
-The build installer uses the same Python interpreter as Gunicorn and stores the pinned Chromium headless shell in the absolute project-local `.playwright-browsers` path. The start command checks the browser in the runtime image and installs it there if the build artifact omitted the ignored browser directory. Startup verifies that the exact headless-shell binary exists, is executable, and launches with `--version`. `render.yaml` contains a separate Render blueprint; Voroa does not read it.
+`Dockerfile` sets `PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers`; the app and installer resolve that same absolute location. The Docker build runs the installer in the final image, where `--with-deps` installs shared libraries and the pinned Playwright package selects the matching headless-shell revision. Gunicorn checks and launches that same executable at startup. `render.yaml` remains a separate Render blueprint and is not used by Voroa's Docker runtime.
 
 Run one Gunicorn worker. The scheduler and shared-fetch cycle cache are process-local, and SQLite is configured for one application process. The shared-fetch cache reuses a successful compatible result across users due in the same scheduler cycle and coalesces overlapping compatible requests. Each user's snapshots, status, history, and alert handling remain separate. This is not cross-process coordination; horizontal scaling or multiple workers needs a separate shared scheduler/cache design.
 
@@ -99,7 +96,7 @@ Python tests use temporary databases and controlled fetches. The browser extensi
 
 ## Troubleshooting and limitations
 
-- **Chromium executable missing:** the start command repairs a missing browser download in the runtime image. Check startup logs for the selected executable and launch diagnostic. If it still fails, the runtime may not allow downloads or may lack Linux browser libraries; Voroa build logs and runtime logs are needed to confirm.
+- **Chromium or a Linux library is missing:** use the Docker runtime and rebuild the image. The Docker build runs the browser installer and `--with-deps` in the final image, then verifies that the headless shell launches. Check build output for the installer step and startup logs for the selected executable. The dashboard's Python-runtime build/start commands cannot reliably provide OS shared libraries to a separate runtime environment.
 - **A mutation says authentication is not configured:** set a stable `WEBWATCH_SECRET_KEY` of at least 32 random characters in the environment before starting WebWatch. The app does not generate a temporary key because that would invalidate sessions and signatures on restart.
 - **Login says the request could not be verified:** reload the sign-in page, confirm HTTPS and trusted forwarded scheme/host headers, and keep CSRF enabled. Set `WEBWATCH_TRUST_PROXY` only according to the hosting proxy setup.
 - **Check stays queued or waiting to retry:** inspect `GET /api/jobs` and the server logs. Temporary network or renderer errors use bounded retries; failed attempts update the website's visible latest status.
