@@ -22,6 +22,7 @@ const hiddenViewToggle = document.querySelector('#hidden-view-toggle');
 const hiddenViewLabel = hiddenViewToggle.querySelector('.hidden-nav-label');
 let hiddenView = false;
 let websites = [];
+const guestMode = document.body.dataset.guest === 'true';
 const pendingChecks = new Set();
 const pendingRemovals = new Set();
 const pendingVisibilityChanges = new Set();
@@ -148,12 +149,11 @@ async function api(path, options = {}) {
   const headers = { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers };
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
     headers['X-WebWatch-Request'] = '1';
-    let csrf = document.cookie.split('; ').find((part) => part.startsWith('webwatch_csrf='))?.slice('webwatch_csrf='.length) || '';
-    if (!csrf) {
-      const tokenResponse = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
-      if (tokenResponse.ok) csrf = document.cookie.split('; ').find((part) => part.startsWith('webwatch_csrf='))?.slice('webwatch_csrf='.length) || '';
-    }
-    if (csrf) headers['X-CSRF-Token'] = csrf;
+    const tokenResponse = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
+    if (!tokenResponse.ok) throw new Error('A fresh security token could not be created. Reload the page and try again.');
+    const csrf = document.cookie.split('; ').find((part) => part.startsWith('webwatch_csrf='))?.slice('webwatch_csrf='.length) || '';
+    if (!csrf) throw new Error('A fresh security token could not be created. Reload the page and try again.');
+    headers['X-CSRF-Token'] = csrf;
   }
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 15000);
@@ -2078,10 +2078,27 @@ document.querySelector('#start-demo').addEventListener('click', async () => {
   }
 });
 
+const guestExitButton = document.querySelector('#guest-exit');
+if (guestExitButton) guestExitButton.addEventListener('click', async () => {
+  guestExitButton.disabled = true;
+  try {
+    await api('/auth/logout', { method: 'POST' });
+    window.location.assign('/login');
+  } catch (error) {
+    message.textContent = error.message;
+    guestExitButton.disabled = false;
+  }
+});
+
 applyWebsiteView();
 loadWebsites().finally(prefillBrowserExtensionLink);
 loadNotificationHistory();
-loadSchedule(true);
-loadAlertSettings();
+if (!guestMode) {
+  loadSchedule(true);
+  loadAlertSettings();
+}
 refreshJobQueue();
-window.setInterval(async () => { await loadSchedule(); await refreshJobQueue(); }, 10000);
+window.setInterval(async () => {
+  if (!guestMode) await loadSchedule();
+  await refreshJobQueue();
+}, 10000);

@@ -114,6 +114,48 @@ def test_deployment_data_path_defaults_to_local_location_and_accepts_override(tm
     assert not selected.exists()
 
 
+def test_csrf_origin_check_requires_trusted_proxy_scheme_to_match_https_origin(tmp_path, monkeypatch):
+    monkeypatch.setitem(webwatch.app.config, "DATABASE", str(tmp_path / "csrf-proxy.sqlite3"))
+    monkeypatch.setitem(webwatch.app.config, "SECRET_KEY", TEST_SECRET)
+    monkeypatch.setenv("WEBWATCH_OWNER_SETUP_TOKEN", TEST_SETUP_TOKEN)
+    webwatch.init_db()
+    with webwatch.app.app_context():
+        token = auth._csrf_serializer().dumps("test-csrf-nonce")
+    with webwatch.app.test_request_context(
+        "/auth/login",
+        base_url="http://internal.voroa.local",
+        headers={"Origin": "https://watch.example.test", "Cookie": f"{auth.CSRF_COOKIE}={token}"},
+    ):
+        from flask import request
+        request.headers.environ["HTTP_X_CSRF_TOKEN"] = token
+        assert auth.csrf_request_valid() is False
+
+    application = webwatch.trusted_proxy_wsgi(
+        webwatch.app.wsgi_app,
+        enabled=webwatch.trusted_proxy_enabled({"PORT": "10000"}),
+    )
+    response = _wsgi_request(
+        application,
+        "/auth/login",
+        "POST",
+        payload={"email": "nobody@example.test", "password": "incorrect"},
+        headers={
+            "Origin": "https://watch.example.test",
+            "Cookie": f"{auth.CSRF_COOKIE}={token}",
+            "X-CSRF-Token": token,
+        },
+    )
+    # CSRF passes at the proxy-aware origin; authentication then rejects the
+    # deliberately invalid credentials.
+    assert response.status_code == 401
+
+
+def test_trusted_proxy_autodetection_is_limited_to_platform_port_and_can_be_disabled():
+    assert webwatch.trusted_proxy_enabled({"PORT": "10000"}) is True
+    assert webwatch.trusted_proxy_enabled({}) is False
+    assert webwatch.trusted_proxy_enabled({"PORT": "10000", "WEBWATCH_TRUST_PROXY": "false"}) is False
+
+
 def test_gunicorn_configuration_uses_one_worker_and_scheduler_hooks(monkeypatch):
     config_path = Path(__file__).parents[1] / "gunicorn.conf.py"
     config = runpy.run_path(str(config_path))

@@ -29,6 +29,9 @@ DUMMY_PASSWORD_HASH = "$argon2id$v=19$m=65536,t=3,p=2$3+MIg9PctcIoKgfspfjpGw$kYE
 SESSION_COOKIE = "__Host-webwatch_session"
 CSRF_COOKIE = "webwatch_csrf"
 SESSION_DAYS = 30
+DEFAULT_GUEST_TTL_SECONDS = 6 * 60 * 60
+MAX_GUEST_TTL_SECONDS = 24 * 60 * 60
+MAX_ACTIVE_GUESTS = 100
 INVITATION_DAYS = 7
 LOGIN_WINDOW_SECONDS = 900
 LOGIN_MAX_ATTEMPTS = 5
@@ -62,14 +65,15 @@ def _csrf_serializer():
     return URLSafeTimedSerializer(secret, salt="webwatch-csrf-v1") if secret else None
 
 
-def _cookie_headers(response, session_token=None, csrf_token=None, clear=False):
+def _cookie_headers(response, session_token=None, csrf_token=None, clear=False, session_max_age=None):
     if clear:
         response.set_cookie(SESSION_COOKIE, "", max_age=0, expires=0, path="/", secure=True,
                             httponly=True, samesite="Lax")
         response.set_cookie(CSRF_COOKIE, "", max_age=0, expires=0, path="/", secure=True,
                             httponly=False, samesite="Strict")
     if session_token is not None:
-        response.set_cookie(SESSION_COOKIE, session_token, max_age=SESSION_DAYS * 86400,
+        response.set_cookie(SESSION_COOKIE, session_token,
+                            max_age=session_max_age or SESSION_DAYS * 86400,
                             path="/", secure=True, httponly=True, samesite="Lax")
     if csrf_token is not None:
         response.set_cookie(CSRF_COOKIE, csrf_token, max_age=3600, path="/", secure=True,
@@ -79,9 +83,9 @@ def _cookie_headers(response, session_token=None, csrf_token=None, clear=False):
     return response
 
 
-def _json(payload, status=200, *, session_token=None, csrf_token=None, clear=False):
+def _json(payload, status=200, *, session_token=None, csrf_token=None, clear=False, session_max_age=None):
     response = make_response(jsonify(payload), status)
-    return _cookie_headers(response, session_token, csrf_token, clear)
+    return _cookie_headers(response, session_token, csrf_token, clear, session_max_age)
 
 
 def _request_token_hash(token):
@@ -99,6 +103,47 @@ def _normalize_email(value):
 
 def _password_ok(password):
     return isinstance(password, str) and 12 <= len(password) <= 1024 and len(password.encode("utf-8")) <= 1024
+
+
+def guest_ttl_seconds():
+    try:
+        value = int(os.environ.get("WEBWATCH_GUEST_TTL_SECONDS", DEFAULT_GUEST_TTL_SECONDS))
+    except (TypeError, ValueError):
+        value = DEFAULT_GUEST_TTL_SECONDS
+    return min(MAX_GUEST_TTL_SECONDS, max(900, value))
+
+
+def cleanup_expired_guest_accounts(database_path):
+    """Delete expired guest users and their complete owned data atomically."""
+    db = sqlite3.connect(database_path, timeout=30)
+    try:
+        db.row_factory = sqlite3.Row
+        now = _iso(_now())
+        if not db.execute(
+            "SELECT 1 FROM guest_accounts WHERE expires_at <= ? LIMIT 1", (now,)
+        ).fetchone():
+            return 0
+        db.execute("PRAGMA foreign_keys = ON")
+        db.execute("BEGIN IMMEDIATE")
+        guest_ids = [row[0] for row in db.execute(
+            "SELECT user_id FROM guest_accounts WHERE expires_at <= ?", (now,)
+        )]
+        for user_id in guest_ids:
+            db.execute("DELETE FROM alert_jobs WHERE owner_id = ?", (user_id,))
+            db.execute("DELETE FROM notifications WHERE owner_id = ?", (user_id,))
+            db.execute("DELETE FROM invitations WHERE created_by = ?", (user_id,))
+            db.execute("UPDATE invitations SET used_by = NULL WHERE used_by = ?", (user_id,))
+            db.execute("DELETE FROM connectivity_incidents WHERE owner_id = ?", (user_id,))
+            db.execute("DELETE FROM websites WHERE owner_id = ?", (user_id,))
+            db.execute("DELETE FROM guest_accounts WHERE user_id = ?", (user_id,))
+            db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        db.commit()
+        return len(guest_ids)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def provision_demo_account(database_path, email, password):
@@ -166,9 +211,13 @@ def _session_user(db):
     if len(token) < 32 or len(token) > 256:
         return None
     row = db.execute(
-        "SELECT u.id, u.email, u.role FROM auth_sessions s "
-        "JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND u.is_active = 1",
-        (_request_token_hash(token), _iso(_now())),
+        "SELECT u.id, u.email, u.role, "
+        "CASE WHEN g.user_id IS NULL THEN 0 ELSE 1 END AS is_guest "
+        "FROM auth_sessions s JOIN users u ON u.id = s.user_id "
+        "LEFT JOIN guest_accounts g ON g.user_id = u.id "
+        "WHERE s.token_hash = ? AND s.expires_at > ? AND u.is_active = 1 "
+        "AND (g.user_id IS NULL OR g.expires_at > ?)",
+        (_request_token_hash(token), _iso(_now()), _iso(_now())),
     ).fetchone()
     return dict(row) if row else None
 
@@ -200,11 +249,26 @@ def protect_auth_mutations():
             return _json({"error": "This request could not be verified. Reload the page and try again."}, 403)
 
 
+@auth_blueprint.before_request
+def restrict_guest_auth_routes():
+    db = _database()
+    try:
+        user = _session_user(db)
+    finally:
+        db.close()
+    if user and user["is_guest"] and request.path not in {
+        "/auth/status", "/auth/csrf", "/auth/logout", "/auth/guest",
+    }:
+        return _json({"error": "This action is not available in guest mode."}, 403)
+
+
 @auth_blueprint.get("/auth/status")
 def auth_status():
     db = _database()
     try:
-        count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        count = db.execute(
+            "SELECT COUNT(*) FROM users WHERE id NOT IN (SELECT user_id FROM guest_accounts)"
+        ).fetchone()[0]
         owner_count = db.execute("SELECT COUNT(*) FROM users WHERE role = 'owner'").fetchone()[0]
         return _json({
             "account_exists": count > 0,
@@ -224,6 +288,47 @@ def csrf_token():
         return _json({"error": "Authentication is not configured."}, 503)
     token = serializer.dumps(secrets.token_urlsafe(32))
     return _json({"ok": True}, csrf_token=token)
+
+
+@auth_blueprint.post("/auth/guest")
+def start_guest_session():
+    """Create a private, temporary member identity for this browser session."""
+    database_path = current_app.config["DATABASE"]
+    cleanup_expired_guest_accounts(database_path)
+    ttl = guest_ttl_seconds()
+    now = _now()
+    expires_at = _iso(now + timedelta(seconds=ttl))
+    email = f"guest-{secrets.token_hex(24)}@guest.invalid"
+    session_token = secrets.token_urlsafe(48)
+    csrf_token = _csrf_serializer().dumps(secrets.token_urlsafe(32))
+    db = _database()
+    try:
+        if _session_user(db) is not None:
+            return _json({"error": "Sign out before starting a guest session."}, 409)
+        db.execute("BEGIN IMMEDIATE")
+        active = db.execute("SELECT COUNT(*) FROM guest_accounts WHERE expires_at > ?", (_iso(now),)).fetchone()[0]
+        if active >= MAX_ACTIVE_GUESTS:
+            db.rollback()
+            return _json({"error": "Guest sessions are temporarily full. Please try again later."}, 503)
+        password_hash = password_hasher.hash(secrets.token_urlsafe(48))
+        cursor = db.execute(
+            "INSERT INTO users(email,email_normalized,password_hash,role,created_at) VALUES(?,?,?,'member',?)",
+            (email, email, password_hash, _iso(now)),
+        )
+        user_id = cursor.lastrowid
+        db.execute("INSERT INTO guest_accounts(user_id,expires_at) VALUES(?,?)", (user_id, expires_at))
+        db.execute(
+            "INSERT INTO auth_sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)",
+            (_request_token_hash(session_token), user_id, _iso(now), expires_at),
+        )
+        db.commit()
+        return _json({"ok": True, "expires_at": expires_at}, session_token=session_token,
+                     csrf_token=csrf_token, session_max_age=ttl)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @auth_blueprint.post("/auth/setup")
@@ -372,8 +477,18 @@ def logout():
     db = _database()
     try:
         if token:
-            db.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (_request_token_hash(token),))
+            token_hash = _request_token_hash(token)
+            guest = db.execute(
+                "SELECT g.user_id FROM guest_accounts g JOIN auth_sessions s ON s.user_id=g.user_id "
+                "WHERE s.token_hash=?", (token_hash,),
+            ).fetchone()
+            if guest:
+                db.execute("UPDATE guest_accounts SET expires_at=? WHERE user_id=?",
+                           (_iso(_now()), guest["user_id"]))
+            db.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
             db.commit()
+            if guest:
+                cleanup_expired_guest_accounts(current_app.config["DATABASE"])
         return _json({"ok": True}, clear=True)
     finally:
         db.close()
@@ -576,6 +691,14 @@ def migrate_auth_schema(database_path):
                 raise RuntimeError("The connectivity incident owner index name is already used by an unexpected index.")
             db.execute("CREATE INDEX IF NOT EXISTS connectivity_incidents_owner_recent ON connectivity_incidents(owner_id, id DESC)")
             db.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (2, ?)", (_iso(_now()),))
+        if not db.execute("SELECT 1 FROM schema_migrations WHERE version = 3").fetchone():
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS guest_accounts ("
+                "user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, "
+                "expires_at TEXT NOT NULL)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS guest_accounts_expiry ON guest_accounts(expires_at)")
+            db.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)", (_iso(_now()),))
         violations = db.execute("PRAGMA foreign_key_check").fetchall()
         if violations:
             raise RuntimeError("Authentication migration produced foreign-key violations.")

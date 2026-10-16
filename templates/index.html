@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
     <script src="{{ url_for('static', filename='app.js') }}" defer></script>
   </head>
-  <body>
+  <body data-guest="{{ 'true' if guest_mode else 'false' }}">
     <div class="app-shell">
       <header class="topbar">
         <a class="brand" href="/" aria-label="WebWatch home">
@@ -21,14 +21,15 @@
           <nav aria-label="Dashboard navigation">
             <a href="#watchlist-heading">Watchlist</a>
             <a href="#notification-heading">Serious events</a>
-            <a href="#schedule-heading">Automatic monitoring</a>
-            <a href="#alerts-heading">Email and webhook alerts</a>
+            {% if not guest_mode %}<a href="#schedule-heading">Automatic monitoring</a>
+            <a href="#alerts-heading">Email and webhook alerts</a>{% endif %}
             <a href="#job-queue-heading">Check queue</a>
             <button type="button" id="open-guide">Guide</button>
           </nav>
         </details>
         <div class="header-tools">
-          <a class="account-link" href="/account">Account</a>
+          {% if guest_mode %}<button class="account-link" id="guest-exit" type="button">Exit guest</button>
+          {% else %}<a class="account-link" href="/account">Account</a>{% endif %}
           <span class="product-label">Website monitor</span>
           <button class="hidden-nav" id="hidden-view-toggle" type="button" aria-pressed="false" aria-label="Open Hidden Websites" title="Open Hidden Websites">
             <svg class="eye-open" aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M2 10s2.9-5 8-5 8 5 8 5-2.9 5-8 5-8-5-8-5Z"/><circle cx="10" cy="10" r="2.2"/></svg>
@@ -43,6 +44,7 @@
       </header>
 
       <main class="main-content">
+        {% if guest_mode %}<p class="guest-banner" role="status">Temporary guest session · up to five websites · data is deleted after this session expires.</p>{% endif %}
         <div class="page-heading">
           <div>
             <p class="eyebrow" id="view-eyebrow">YOUR WATCHLIST</p>
@@ -169,7 +171,7 @@
           <p class="implementation-note" id="implementation-note">Websites are saved by this app. Checks run manually or on the automatic schedule.</p>
         </section>
 
-        <section class="schedule-panel" aria-labelledby="schedule-heading">
+        <section class="schedule-panel" aria-labelledby="schedule-heading"{% if guest_mode %} hidden{% endif %}>
           <div class="schedule-heading">
             <div>
               <h2 id="schedule-heading">Automatic monitoring</h2>
@@ -205,7 +207,7 @@
           <p class="schedule-status" id="schedule-status" role="status" aria-live="polite"></p>
         </section>
 
-        <section class="schedule-panel alert-settings-panel" aria-labelledby="alerts-heading">
+        <section class="schedule-panel alert-settings-panel" aria-labelledby="alerts-heading"{% if guest_mode %} hidden{% endif %}>
           <div class="schedule-heading"><div><h2 id="alerts-heading">Email and webhook alerts</h2>
             <p>Get alerts for meaningful changes and serious availability events. Change alerts are limited to one per page per hour.</p></div></div>
           <form id="alert-settings-form" class="alert-settings-form">

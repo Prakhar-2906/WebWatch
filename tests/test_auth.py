@@ -4,6 +4,7 @@ import json
 import sqlite3
 
 import pytest
+from itsdangerous import TimestampSigner, URLSafeTimedSerializer
 
 import app as webwatch
 import auth
@@ -148,6 +149,35 @@ def test_auth_mutations_require_csrf_and_login_failures_are_generic_and_limited(
     assert {response.get_json()["error"] for response in responses} == {"Email or password is incorrect."}
     with sqlite3.connect(database) as db:
         assert db.execute("SELECT attempts FROM login_rate_limits").fetchone()[0] == 5
+
+
+def test_csrf_tokens_expire_and_fresh_tokens_remain_valid(auth_client):
+    _client, _database = auth_client
+
+    class ExpiredTimestampSigner(TimestampSigner):
+        def get_timestamp(self):
+            return super().get_timestamp() - 3601
+
+    expired_serializer = URLSafeTimedSerializer(
+        webwatch.app.config["SECRET_KEY"],
+        salt="webwatch-csrf-v1",
+        signer=ExpiredTimestampSigner,
+    )
+    expired_token = expired_serializer.dumps("old-csrf-nonce")
+    with webwatch.app.app_context():
+        fresh_token = auth._csrf_serializer().dumps("fresh-csrf-nonce")
+
+    with webwatch.app.test_request_context(
+        "/auth/login",
+        headers={"Cookie": f"{auth.CSRF_COOKIE}={expired_token}", "X-CSRF-Token": expired_token},
+    ):
+        assert auth.csrf_request_valid() is False
+
+    with webwatch.app.test_request_context(
+        "/auth/login",
+        headers={"Cookie": f"{auth.CSRF_COOKIE}={fresh_token}", "X-CSRF-Token": fresh_token},
+    ):
+        assert auth.csrf_request_valid() is True
 
 
 def test_expired_session_and_invitation_are_rejected(auth_client):

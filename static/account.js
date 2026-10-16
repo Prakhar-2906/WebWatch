@@ -3,8 +3,8 @@
   const message = document.getElementById('invite-message');
   const cookie = () => document.cookie.split('; ').find((part) => part.startsWith('webwatch_csrf='))?.slice('webwatch_csrf='.length) || '';
   async function getCsrf() {
-    if (cookie()) return cookie();
-    await fetch('/auth/csrf', { credentials: 'same-origin' });
+    const response = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
+    if (!response.ok) throw new Error('A fresh security token could not be created. Reload the page and try again.');
     return cookie();
   }
   async function request(path, method, body) {

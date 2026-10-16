@@ -42,7 +42,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.exceptions import NewConnectionError
 from werkzeug.middleware.proxy_fix import ProxyFix
 from auth import (auth_blueprint, authenticated_user, csrf_request_valid,
-                  migrate_auth_schema, provision_demo_account)
+                  cleanup_expired_guest_accounts, migrate_auth_schema,
+                  provision_demo_account)
 
 app = Flask(__name__)
 DEFAULT_DATABASE_PATH = Path(app.instance_path) / "webwatch.sqlite3"
@@ -55,10 +56,24 @@ def configured_database_path(default_path, override=None):
 
 
 def trusted_proxy_wsgi(application, enabled=False):
-    """Trust exactly one hosting proxy only when deployment explicitly enables it."""
+    """Wrap the app with exactly one trusted hosting proxy when enabled."""
     if not enabled:
         return application
     return ProxyFix(application, x_for=1, x_proto=1, x_host=1)
+
+
+def trusted_proxy_enabled(environ=None):
+    """Trust the platform's one edge proxy when its assigned PORT is present.
+
+    An explicit WEBWATCH_TRUST_PROXY value always wins. Managed web services
+    provide PORT and route public traffic through their edge proxy; local
+    development without PORT keeps forwarded headers untrusted by default.
+    """
+    environment = os.environ if environ is None else environ
+    configured = environment.get("WEBWATCH_TRUST_PROXY")
+    if configured is not None:
+        return configured.strip().lower() in {"1", "true", "yes"}
+    return bool(environment.get("PORT"))
 
 
 app.config["DATABASE"] = configured_database_path(DEFAULT_DATABASE_PATH)
@@ -68,7 +83,7 @@ app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 app.register_blueprint(auth_blueprint)
 app.wsgi_app = trusted_proxy_wsgi(
     app.wsgi_app,
-    os.environ.get("WEBWATCH_TRUST_PROXY", "").strip().lower() in {"1", "true", "yes"},
+    trusted_proxy_enabled(),
 )
 
 REQUEST_TIMEOUT = (4, 8)  # connect timeout, read timeout (seconds)
@@ -104,6 +119,9 @@ DEMO_BASELINE = Path(__file__).parent / "test-page" / "page.html"
 DEMO_CHANGED = Path(__file__).parent / "test-page" / "page-changed.html"
 _database_init_lock = threading.Lock()
 _initialized_database_paths = set()
+_guest_cleanup_lock = threading.Lock()
+_last_guest_cleanup_at = 0.0
+MAX_GUEST_WEBSITES = 5
 _website_check_locks_guard = threading.Lock()
 _website_check_locks = {}
 _domain_check_locks_guard = threading.Lock()
@@ -275,7 +293,9 @@ def owner_settings_for_id(db, owner_id, pattern=None, exact=None):
     values = {row["setting_key"]: row["setting_value"] for row in db.execute(sql, params)}
     # app_settings is the preserved legacy settings source for the explicitly
     # claimed first owner. It is never a fallback for invited accounts.
-    if owner_id == 1:
+    if owner_id == 1 and not db.execute(
+        "SELECT 1 FROM guest_accounts WHERE user_id = ?", (owner_id,)
+    ).fetchone():
         legacy_sql = "SELECT setting_key, setting_value FROM app_settings"
         legacy_params = []
         if pattern:
@@ -578,6 +598,23 @@ def ensure_db_initialized():
             init_db()
 
 
+def cleanup_expired_guests_if_due():
+    """Run bounded guest cleanup opportunistically and from the scheduler."""
+    global _last_guest_cleanup_at
+    now = time.monotonic()
+    with _guest_cleanup_lock:
+        if now - _last_guest_cleanup_at < 60:
+            return 0
+        _last_guest_cleanup_at = now
+    try:
+        return cleanup_expired_guest_accounts(app.config["DATABASE"])
+    except Exception:
+        with _guest_cleanup_lock:
+            _last_guest_cleanup_at = 0.0
+        app.logger.exception("Expired guest-data cleanup failed; it will retry.")
+        return 0
+
+
 def enforce_site_retention(db, website_id):
     """Trim excess no-change, content-change, and serious-event records per site."""
     site = db.execute(
@@ -620,6 +657,7 @@ def require_same_origin_api_mutations():
 def initialize_database_for_all_flask_entrypoints():
     """Run additive schema setup even when launched with `flask --app app run`."""
     ensure_db_initialized()
+    cleanup_expired_guests_if_due()
 
 
 @app.before_request
@@ -634,6 +672,11 @@ def require_authenticated_owner_scope():
             return jsonify(error="Authentication required."), 401
         return redirect(url_for("login_page", next=request.full_path))
     g.webwatch_user = user
+    if user.get("is_guest") and (
+        request.endpoint == "account_page"
+        or request.path.startswith(("/api/schedule", "/api/alerts"))
+    ):
+        return jsonify(error="This feature is not available in temporary guest mode."), 403
     website_id = request.view_args.get("website_id") if request.view_args else None
     snapshot_id = request.view_args.get("snapshot_id") if request.view_args else None
     if website_id is not None:
@@ -1755,7 +1798,7 @@ def queue_daily_digest_if_due():
 @app.get("/")
 def index():
     """Show the dashboard."""
-    return render_template("index.html")
+    return render_template("index.html", guest_mode=bool(g.webwatch_user.get("is_guest")))
 
 
 @app.after_request
@@ -2220,10 +2263,12 @@ def scheduler_loop():
 def run_due_schedule():
     """Run each account's due sites and durable jobs with that account's settings."""
     ensure_db_initialized()
+    cleanup_expired_guests_if_due()
     with app.app_context():
         with get_db() as db:
             owner_ids = [row[0] for row in db.execute(
-                "SELECT id FROM users WHERE is_active = 1 ORDER BY id")]
+                "SELECT id FROM users WHERE is_active = 1 "
+                "AND id NOT IN (SELECT user_id FROM guest_accounts) ORDER BY id")]
     results = []
     for owner_id in owner_ids:
         with app.app_context():
@@ -2344,6 +2389,12 @@ def create_website_record(data):
                         error="That webpage is already in your watchlist.",
                         website=website_for_ui(db, existing),
                     ), 409
+            if getattr(g, "webwatch_user", {}).get("is_guest"):
+                guest_count = db.execute(
+                    "SELECT COUNT(*) FROM websites WHERE owner_id = ?", (current_owner_id(),)
+                ).fetchone()[0]
+                if guest_count >= MAX_GUEST_WEBSITES:
+                    return jsonify(error=f"Guest sessions can monitor up to {MAX_GUEST_WEBSITES} websites."), 429
             cursor = db.execute(
                 "INSERT INTO websites (url, created_at, display_name, check_interval_minutes, owner_id) VALUES (?, ?, ?, ?, ?)",
                 (safe_url, utc_now(), display_name, interval, current_owner_id()),

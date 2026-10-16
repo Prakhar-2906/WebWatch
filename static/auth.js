@@ -6,14 +6,13 @@
   const intro = document.getElementById('auth-intro');
   const setupLink = document.getElementById('auth-setup-link');
   const inviteLink = document.querySelector('.auth-links a[href="/invite"]');
+  const guestButton = document.getElementById('guest-start');
   const readCookie = (name) => document.cookie.split('; ').find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1) || '';
   async function csrf() {
-    let token = readCookie('webwatch_csrf');
-    if (!token) {
-      const response = await fetch('/auth/csrf', { credentials: 'same-origin' });
-      if (!response.ok) throw new Error('Authentication is not configured on this server.');
-      token = readCookie('webwatch_csrf');
-    }
+    const response = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
+    if (!response.ok) throw new Error('Authentication is not configured on this server.');
+    const token = readCookie('webwatch_csrf');
+    if (!token) throw new Error('A fresh security token could not be created. Reload the page and try again.');
     return token;
   }
   async function send(path, payload, headers = {}) {
@@ -34,6 +33,17 @@
     } else intro.textContent = 'Enter the email address the invitation was sent to and the invitation code from that email.';
     if (mode !== 'invite' && inviteLink) inviteLink.hidden = true;
   }).catch(() => { intro.textContent = 'Account status could not be loaded.'; });
+  if (guestButton) guestButton.addEventListener('click', async () => {
+    guestButton.disabled = true;
+    message.textContent = 'Starting a temporary guest session…';
+    try {
+      await send('/auth/guest', {});
+      window.location.assign('/');
+    } catch (error) {
+      message.textContent = error.message;
+      guestButton.disabled = false;
+    }
+  });
   form.addEventListener('submit', async (event) => {
     event.preventDefault(); message.textContent = '';
     const payload = { email: document.getElementById('email').value, password: document.getElementById('password').value };
