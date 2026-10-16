@@ -287,7 +287,11 @@ def csrf_token():
     if serializer is None:
         return _json({"error": "Authentication is not configured."}, 503)
     token = serializer.dumps(secrets.token_urlsafe(32))
-    return _json({"ok": True}, csrf_token=token)
+    # The token is already intentionally readable by same-origin JavaScript
+    # through the double-submit cookie. Returning it also avoids relying on
+    # document.cookie when browser cookie policies hide Secure cookies on a
+    # local development origin. The server still requires both values to match.
+    return _json({"ok": True, "csrf_token": token}, csrf_token=token)
 
 
 @auth_blueprint.post("/auth/guest")

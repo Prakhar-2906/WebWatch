@@ -210,7 +210,9 @@ def test_auth_pages_do_not_render_setup_or_csrf_secrets(auth_client):
     for response in (setup_page, login_page, invite_page):
         assert b"owner-setup-test-token" not in response.data
     csrf_response = client.get("/auth/csrf")
-    assert csrf_response.get_json() == {"ok": True}
+    csrf_token = csrf_response.get_json()["csrf_token"]
+    assert csrf_response.get_json() == {"ok": True, "csrf_token": csrf_token}
+    assert csrf_token == client.get_cookie(auth.CSRF_COOKIE).value
     assert "webwatch_csrf" in csrf_response.headers.get("Set-Cookie", "")
     assert client.get("/auth/status").get_json()["initial_setup_available"] is True
 
@@ -220,6 +222,16 @@ def test_auth_pages_do_not_render_setup_or_csrf_secrets(auth_client):
     assert client.get("/auth/status").get_json()["initial_setup_available"] is False
     assert client.get("/account").status_code == 200
     assert auth.SESSION_COOKIE not in json.dumps(client.get("/auth/me").get_json())
+
+
+def test_csrf_endpoint_explains_missing_server_secret(auth_client, monkeypatch):
+    client, _database = auth_client
+    monkeypatch.setitem(webwatch.app.config, "SECRET_KEY", None)
+
+    response = client.get("/auth/csrf")
+
+    assert response.status_code == 503
+    assert response.get_json() == {"error": "Authentication is not configured."}
 
 
 def _make_legacy_database(path, monkeypatch):

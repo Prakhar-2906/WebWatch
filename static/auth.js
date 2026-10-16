@@ -7,11 +7,11 @@
   const setupLink = document.getElementById('auth-setup-link');
   const inviteLink = document.querySelector('.auth-links a[href="/invite"]');
   const guestButton = document.getElementById('guest-start');
-  const readCookie = (name) => document.cookie.split('; ').find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1) || '';
   async function csrf() {
     const response = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
-    if (!response.ok) throw new Error('Authentication is not configured on this server.');
-    const token = readCookie('webwatch_csrf');
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || 'Authentication is not configured on this server.');
+    const token = result.csrf_token;
     if (!token) throw new Error('A fresh security token could not be created. Reload the page and try again.');
     return token;
   }

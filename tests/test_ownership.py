@@ -104,6 +104,40 @@ def test_sensitive_dashboard_and_resource_routes_require_authentication(tmp_path
     assert client.get("/auth/status").status_code == 200
 
 
+def test_delete_website_requires_csrf_and_persists_cascade(tmp_path, monkeypatch):
+    database = tmp_path / "delete-website.sqlite3"
+    monkeypatch.setitem(webwatch.app.config, "DATABASE", str(database))
+    monkeypatch.setitem(webwatch.app.config, "SECRET_KEY", TEST_SECRET)
+    monkeypatch.setenv("WEBWATCH_OWNER_SETUP_TOKEN", TEST_SETUP_TOKEN)
+    webwatch.init_db()
+    client = webwatch.app.test_client()
+    setup_test_owner(client)
+    created = client.post("/api/websites", json={"url": "https://example.com/"})
+    assert created.status_code == 201
+    website_id = created.get_json()["id"]
+    with webwatch.get_db() as db:
+        db.execute(
+            "INSERT INTO snapshots(website_id,content_text,checked_at,record_type) VALUES(?,?,?,?)",
+            (website_id, "saved history", webwatch.utc_now(), "baseline"),
+        )
+
+    rejected = client.delete(f"/api/websites/{website_id}", headers={
+        "X-WebWatch-Request": "1", "X-CSRF-Token": "invalid-token",
+    })
+    assert rejected.status_code == 403
+    with webwatch.get_db() as db:
+        assert db.execute("SELECT 1 FROM websites WHERE id=?", (website_id,)).fetchone()
+
+    response = client.delete(f"/api/websites/{website_id}", headers={
+        "X-WebWatch-Request": "1", "X-CSRF-Token": client.get_cookie(auth.CSRF_COOKIE).value,
+    })
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
+    with webwatch.get_db() as db:
+        assert db.execute("SELECT 1 FROM websites WHERE id=?", (website_id,)).fetchone() is None
+        assert db.execute("SELECT 1 FROM snapshots WHERE website_id=?", (website_id,)).fetchone() is None
+
+
 def test_background_manual_jobs_keep_their_owners(tmp_path, monkeypatch):
     database = tmp_path / "owner-jobs.sqlite3"
     monkeypatch.setitem(webwatch.app.config, "DATABASE", str(database))

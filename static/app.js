@@ -151,10 +151,12 @@ async function api(path, options = {}) {
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
     headers['X-WebWatch-Request'] = '1';
     const tokenResponse = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
-    if (!tokenResponse.ok) throw new Error('A fresh security token could not be created. Reload the page and try again.');
-    const csrf = document.cookie.split('; ').find((part) => part.startsWith('webwatch_csrf='))?.slice('webwatch_csrf='.length) || '';
-    if (!csrf) throw new Error('A fresh security token could not be created. Reload the page and try again.');
-    headers['X-CSRF-Token'] = csrf;
+    const tokenResult = await tokenResponse.json().catch(() => ({}));
+    if (!tokenResponse.ok) throw new Error(tokenResult.error || 'A fresh security token could not be created. Reload the page and try again.');
+    if (typeof tokenResult.csrf_token !== 'string' || !tokenResult.csrf_token) {
+      throw new Error('A fresh security token could not be created. Reload the page and try again.');
+    }
+    headers['X-CSRF-Token'] = tokenResult.csrf_token;
   }
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), timeoutMs);

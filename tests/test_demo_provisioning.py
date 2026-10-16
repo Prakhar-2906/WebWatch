@@ -56,12 +56,12 @@ def test_demo_account_provisioning_is_hashed_idempotent_and_uses_selected_databa
     # Provisioning the demo member does not consume the separate first-owner setup flow.
     assert client.get("/auth/status").get_json()["initial_setup_available"] is True
     setup_token = client.get("/auth/csrf").get_json()
+    assert setup_token["ok"] is True and setup_token["csrf_token"]
     csrf_cookie = client.get_cookie(auth.CSRF_COOKIE).value
     owner_setup = client.post("/auth/setup", json={"email": "real-owner@example.test",
                                                     "password": "long secure owner password"}, headers={
         "X-CSRF-Token": csrf_cookie, "X-WebWatch-Owner-Setup": TEST_SETUP_TOKEN,
     })
-    assert setup_token == {"ok": True}
     assert owner_setup.status_code == 201
     assert owner_setup.get_json()["user"]["role"] == "owner"
 

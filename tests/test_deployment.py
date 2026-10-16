@@ -218,6 +218,40 @@ def test_playwright_deployment_check_rejects_missing_actual_headless_shell(monke
     assert str(regular_executable) in str(error.value)
 
 
+def test_playwright_deployment_check_executes_exact_runtime_binary(monkeypatch, tmp_path):
+    browser_root = tmp_path / ".playwright-browsers"
+    regular_executable = browser_root / "chromium-1248" / "chrome-linux64" / "chrome"
+    shell = webwatch.playwright_headless_shell_path(
+        regular_executable, system="linux", machine="x86_64", browsers_dir=browser_root,
+    )
+    shell.parent.mkdir(parents=True)
+    shell.touch()
+    monkeypatch.setattr(webwatch, "PLAYWRIGHT_BROWSERS_DIR", browser_root)
+    monkeypatch.setattr(webwatch.sys, "platform", "linux")
+    monkeypatch.setattr(webwatch.platform, "machine", lambda: "x86_64")
+
+    class FakePlaywrightContext:
+        chromium = type("Chromium", (), {"executable_path": str(regular_executable)})()
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+
+    sync_api = ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = FakePlaywrightContext
+    playwright_package = ModuleType("playwright")
+    playwright_package.__path__ = []
+    monkeypatch.setitem(sys.modules, "playwright", playwright_package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    monkeypatch.setattr(webwatch.os, "access", lambda path, _mode: Path(path) == shell)
+    launches = []
+    monkeypatch.setattr(webwatch.subprocess, "run", lambda command, **kwargs: (
+        launches.append((command, kwargs)) or type("Completed", (), {"stdout": "Chrome headless shell", "stderr": ""})()
+    ))
+
+    assert webwatch.verify_playwright_browser() == shell
+    assert launches[0][0] == [str(shell), "--version"]
+    assert launches[0][1]["timeout"] == 10
+
+
 def test_runtime_launch_options_use_the_verified_headless_shell(monkeypatch, tmp_path):
     browser_root = tmp_path / ".playwright-browsers"
     regular_executable = browser_root / "chromium-1248" / "chrome-linux64" / "chrome"
@@ -253,3 +287,26 @@ def test_browser_installer_uses_running_python_and_shared_runtime_cache(monkeypa
     assert installed_path.is_absolute()
     assert installed_path == webwatch.PLAYWRIGHT_BROWSERS_DIR.resolve()
     assert verified == [True]
+
+
+def test_runtime_browser_installer_repairs_missing_build_artifact(monkeypatch, tmp_path):
+    script_path = Path(__file__).parents[1] / "tools" / "install_playwright_browser.py"
+    install_calls = []
+    checks = iter([RuntimeError("missing build artifact"), None])
+
+    def verify():
+        result = next(checks)
+        if isinstance(result, Exception):
+            raise result
+        return True
+
+    monkeypatch.setattr(webwatch, "verify_playwright_browser", verify)
+    installer = runpy.run_path(str(script_path))
+    monkeypatch.setattr(installer["subprocess"], "run", lambda command, **kwargs: install_calls.append((command, kwargs)))
+    monkeypatch.chdir(tmp_path)
+
+    installer["main"](platform="linux", runtime=True)
+
+    command, options = install_calls[0]
+    assert command == [installer["sys"].executable, "-m", "playwright", "install", "--only-shell", "chromium"]
+    assert Path(options["env"]["PLAYWRIGHT_BROWSERS_PATH"]) == webwatch.PLAYWRIGHT_BROWSERS_DIR.resolve()

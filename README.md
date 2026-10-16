@@ -48,16 +48,16 @@ Voroa installs `requirements.txt` before its custom build command. Set these in 
 **Build command**
 
 ```sh
-python tools/install_playwright_browser.py
+pip install -r requirements.txt && python tools/install_playwright_browser.py
 ```
 
 **Start command**
 
 ```sh
-python -m gunicorn --config gunicorn.conf.py --bind 0.0.0.0:$PORT app:app
+python tools/install_playwright_browser.py --runtime && python -m gunicorn --config gunicorn.conf.py --bind 0.0.0.0:$PORT app:app
 ```
 
-The installer invokes the installed Playwright package with the same Python interpreter used by Gunicorn. It stores Chromium's headless shell in the project-local `.playwright-browsers` directory. Gunicorn verifies the expected executable before starting the scheduler. `render.yaml` contains the separate Render blueprint command, which also installs `requirements.txt`; Voroa does not read that file.
+The build installer uses the same Python interpreter as Gunicorn and stores the pinned Chromium headless shell in the absolute project-local `.playwright-browsers` path. The start command checks the browser in the runtime image and installs it there if the build artifact omitted the ignored browser directory. Startup verifies that the exact headless-shell binary exists, is executable, and launches with `--version`. `render.yaml` contains a separate Render blueprint; Voroa does not read it.
 
 Run one Gunicorn worker. The scheduler and shared-fetch cycle cache are process-local, and SQLite is configured for one application process. The shared-fetch cache reuses a successful compatible result across users due in the same scheduler cycle and coalesces overlapping compatible requests. Each user's snapshots, status, history, and alert handling remain separate. This is not cross-process coordination; horizontal scaling or multiple workers needs a separate shared scheduler/cache design.
 
@@ -99,7 +99,8 @@ Python tests use temporary databases and controlled fetches. The browser extensi
 
 ## Troubleshooting and limitations
 
-- **Chromium executable missing:** check that the Voroa build command ran successfully. Startup logs report the expected executable path. Rebuild with `python tools/install_playwright_browser.py`; install and runtime must use the same app version and Playwright requirements.
+- **Chromium executable missing:** the start command repairs a missing browser download in the runtime image. Check startup logs for the selected executable and launch diagnostic. If it still fails, the runtime may not allow downloads or may lack Linux browser libraries; Voroa build logs and runtime logs are needed to confirm.
+- **A mutation says authentication is not configured:** set a stable `WEBWATCH_SECRET_KEY` of at least 32 random characters in the environment before starting WebWatch. The app does not generate a temporary key because that would invalidate sessions and signatures on restart.
 - **Login says the request could not be verified:** reload the sign-in page, confirm HTTPS and trusted forwarded scheme/host headers, and keep CSRF enabled. Set `WEBWATCH_TRUST_PROXY` only according to the hosting proxy setup.
 - **Check stays queued or waiting to retry:** inspect `GET /api/jobs` and the server logs. Temporary network or renderer errors use bounded retries; failed attempts update the website's visible latest status.
 - **Monitoring pauses:** scheduled checks run inside the web process. They stop when the process sleeps or stops; free hosting may also sleep when idle.

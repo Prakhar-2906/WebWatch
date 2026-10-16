@@ -139,7 +139,8 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
     let payload;
     let status = 200;
     let bodyText;
-    if (url.startsWith('/api/schedule')) payload = scheduleResponse;
+    if (url === '/auth/csrf') payload = { ok: true, csrf_token: 'mock-csrf' };
+    else if (url.startsWith('/api/schedule')) payload = scheduleResponse;
     else if (url.startsWith('/api/notifications')) payload = notificationEvents;
     else if (url.startsWith('/api/jobs')) payload = jobs;
     else if (url === '/api/alerts' && options.method === 'PUT') {
@@ -208,6 +209,7 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
         has: (name) => name.toLowerCase() === 'x-total-count' && url.startsWith('/api/notifications'),
         get: () => String(notificationTotal),
       },
+      json: async () => JSON.parse(bodyText ?? JSON.stringify(payload)),
       text: async () => bodyText ?? JSON.stringify(payload),
     };
   }

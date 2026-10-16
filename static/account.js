@@ -1,11 +1,14 @@
 (() => {
   try { document.documentElement.dataset.theme = localStorage.getItem('webwatch.theme.v1') || 'light'; } catch { /* Use light theme when storage is unavailable. */ }
   const message = document.getElementById('invite-message');
-  const cookie = () => document.cookie.split('; ').find((part) => part.startsWith('webwatch_csrf='))?.slice('webwatch_csrf='.length) || '';
   async function getCsrf() {
     const response = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
-    if (!response.ok) throw new Error('A fresh security token could not be created. Reload the page and try again.');
-    return cookie();
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || 'A fresh security token could not be created. Reload the page and try again.');
+    if (typeof result.csrf_token !== 'string' || !result.csrf_token) {
+      throw new Error('A fresh security token could not be created. Reload the page and try again.');
+    }
+    return result.csrf_token;
   }
   async function request(path, method, body) {
     const response = await fetch(path, { method, credentials: 'same-origin', headers: {

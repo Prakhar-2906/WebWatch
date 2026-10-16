@@ -18,6 +18,7 @@ import re
 import socket
 import sqlite3
 import sys
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -118,10 +119,22 @@ def verify_playwright_browser():
             f"regular Chromium path: {regular_executable}). Rebuild with: "
             "python tools/install_playwright_browser.py"
         )
+    try:
+        launch_check = subprocess.run(
+            [str(executable), "--version"], check=True, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diagnostic = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError):
+            diagnostic = (exc.stderr or exc.stdout or diagnostic).strip()
+        raise RuntimeError(
+            f"Playwright Chromium headless shell exists but cannot launch: {executable} ({diagnostic})"
+        ) from exc
     render_logger.info(
-        "Playwright headless shell verified (package=%s, executable=%s)",
+        "Playwright headless shell verified (package=%s, executable=%s, launch=%s)",
         package_version("playwright"),
         executable,
+        launch_check.stdout.strip() or launch_check.stderr.strip(),
     )
     return executable
 
