@@ -11,11 +11,13 @@ import ipaddress
 import json
 import logging
 import os
+import platform
 import smtplib
 import ssl
 import re
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -54,21 +56,72 @@ os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
 DEFAULT_DATABASE_PATH = Path(app.instance_path) / "webwatch.sqlite3"
 
 
+CHROMIUM_LAUNCH_ARGS = [
+    "--disable-background-networking", "--disable-component-update", "--disable-sync", "--no-first-run",
+]
+
+
+def playwright_headless_shell_path(chromium_executable_path, system=None, machine=None, browsers_dir=None):
+    """Resolve the pinned Playwright headless-shell binary beside Chromium's revision."""
+    target_system = sys.platform if system is None else system
+    target_machine = platform.machine().lower() if machine is None else machine.lower()
+    linux_arches = {"x86_64": "linux64", "amd64": "linux64", "aarch64": "linux-arm64", "arm64": "linux-arm64"}
+    if target_system.startswith("linux") and target_machine in linux_arches:
+        executable_parts = (f"chrome-headless-shell-{linux_arches[target_machine]}", "chrome-headless-shell")
+    elif target_system == "win32" and target_machine in {"amd64", "x86_64"}:
+        executable_parts = ("chrome-headless-shell-win64", "chrome-headless-shell.exe")
+    elif target_system == "darwin" and target_machine in {"amd64", "x86_64", "arm64", "aarch64"}:
+        arch = "arm64" if target_machine in {"arm64", "aarch64"} else "x64"
+        executable_parts = (f"chrome-headless-shell-mac-{arch}", "chrome-headless-shell")
+    else:
+        raise RuntimeError(
+            f"Cannot resolve Playwright Chromium headless-shell path for {target_system}/{target_machine}."
+        )
+
+    chromium_directory = next(
+        (parent for parent in Path(chromium_executable_path).parents
+         if parent.name.startswith("chromium-")),
+        None,
+    )
+    revision = chromium_directory.name.removeprefix("chromium-") if chromium_directory else ""
+    if not revision.isdigit():
+        raise RuntimeError(
+            f"Cannot determine Playwright Chromium revision from {chromium_executable_path}."
+        )
+    browser_root = PLAYWRIGHT_BROWSERS_DIR if browsers_dir is None else Path(browsers_dir)
+    return browser_root / f"chromium_headless_shell-{revision}" / Path(*executable_parts)
+
+
+def chromium_headless_launch_options(chromium, system=None, machine=None):
+    """Build the exact headless launch configuration also verified at startup."""
+    return {
+        "headless": True,
+        "executable_path": str(playwright_headless_shell_path(
+            chromium.executable_path, system=system, machine=machine,
+        )),
+        "args": CHROMIUM_LAUNCH_ARGS,
+    }
+
+
 def verify_playwright_browser():
-    """Fail deployment startup clearly when the pinned Chromium shell is absent."""
+    """Fail startup unless the exact headless-shell executable used by rendering exists."""
     from importlib.metadata import version as package_version
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
-        executable = Path(playwright.chromium.executable_path)
+        regular_executable = Path(playwright.chromium.executable_path)
+        executable = playwright_headless_shell_path(regular_executable)
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise RuntimeError(
-            "Playwright Chromium headless-shell executable is missing or not executable: "
-            f"{executable}. Rebuild the deployment with: python tools/install_playwright_browser.py"
+            "Playwright Chromium headless-shell executable is missing or not executable "
+            f"(selected for headless rendering): {executable} (Playwright {package_version('playwright')}; "
+            f"regular Chromium path: {regular_executable}). Rebuild with: "
+            "python tools/install_playwright_browser.py"
         )
     render_logger.info(
-        "Playwright browser verified (package=%s, executable=%s)",
-        package_version("playwright"), executable,
+        "Playwright headless shell verified (package=%s, executable=%s)",
+        package_version("playwright"),
+        executable,
     )
     return executable
 
@@ -1223,8 +1276,7 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
         with sync_playwright() as playwright:
             try:
                 browser = playwright.chromium.launch(
-                    headless=True,
-                    args=["--disable-background-networking", "--disable-component-update", "--disable-sync", "--no-first-run"],
+                    **chromium_headless_launch_options(playwright.chromium),
                 )
             except Exception as exc:
                 log_renderer_exception("chromium_launch", start_url, exc)

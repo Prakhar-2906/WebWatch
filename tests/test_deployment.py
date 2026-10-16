@@ -177,11 +177,27 @@ def test_gunicorn_configuration_uses_one_worker_and_scheduler_hooks(monkeypatch)
     assert stops == [True]
 
 
-def test_playwright_deployment_check_rejects_missing_headless_shell(monkeypatch, tmp_path):
-    missing_executable = tmp_path / "chromium_headless_shell" / "chrome-headless-shell"
+def test_playwright_headless_shell_path_matches_chromium_1248_linux_x64(tmp_path):
+    browser_root = tmp_path / ".playwright-browsers"
+    regular_executable = browser_root / "chromium-1248" / "chrome-linux64" / "chrome"
+    expected_shell = (
+        browser_root / "chromium_headless_shell-1248" / "chrome-headless-shell-linux64"
+        / "chrome-headless-shell"
+    )
+
+    assert webwatch.playwright_headless_shell_path(
+        regular_executable, system="linux", machine="x86_64", browsers_dir=browser_root,
+    ) == expected_shell
+
+
+def test_playwright_deployment_check_rejects_missing_actual_headless_shell(monkeypatch, tmp_path):
+    browser_root = tmp_path / ".playwright-browsers"
+    regular_executable = browser_root / "chromium-1248" / "chrome-linux64" / "chrome"
+    monkeypatch.setattr(webwatch, "PLAYWRIGHT_BROWSERS_DIR", browser_root)
+    missing_executable = webwatch.playwright_headless_shell_path(regular_executable)
 
     class FakePlaywrightContext:
-        chromium = type("Chromium", (), {"executable_path": str(missing_executable)})()
+        chromium = type("Chromium", (), {"executable_path": str(regular_executable)})()
 
         def __enter__(self):
             return self
@@ -199,6 +215,23 @@ def test_playwright_deployment_check_rejects_missing_headless_shell(monkeypatch,
     with pytest.raises(RuntimeError, match="headless-shell executable is missing") as error:
         webwatch.verify_playwright_browser()
     assert str(missing_executable) in str(error.value)
+    assert str(regular_executable) in str(error.value)
+
+
+def test_runtime_launch_options_use_the_verified_headless_shell(monkeypatch, tmp_path):
+    browser_root = tmp_path / ".playwright-browsers"
+    regular_executable = browser_root / "chromium-1248" / "chrome-linux64" / "chrome"
+    expected_shell = (
+        browser_root / "chromium_headless_shell-1248" / "chrome-headless-shell-linux64"
+        / "chrome-headless-shell"
+    )
+    monkeypatch.setattr(webwatch, "PLAYWRIGHT_BROWSERS_DIR", browser_root)
+    chromium = type("Chromium", (), {"executable_path": str(regular_executable)})()
+
+    options = webwatch.chromium_headless_launch_options(chromium, system="linux", machine="x86_64")
+
+    assert options["headless"] is True
+    assert options["executable_path"] == str(expected_shell)
 
 
 def test_browser_installer_uses_running_python_and_shared_runtime_cache(monkeypatch):
@@ -207,6 +240,7 @@ def test_browser_installer_uses_running_python_and_shared_runtime_cache(monkeypa
     monkeypatch.setattr(webwatch, "verify_playwright_browser", lambda: verified.append(True))
     installer = runpy.run_path(str(script_path))
     monkeypatch.setattr(installer["subprocess"], "run", lambda command, **kwargs: install_calls.append((command, kwargs)))
+    monkeypatch.chdir(Path(__file__).parent)
 
     installer["main"](platform="linux")
 
@@ -215,5 +249,7 @@ def test_browser_installer_uses_running_python_and_shared_runtime_cache(monkeypa
         installer["sys"].executable, "-m", "playwright", "install",
         "--only-shell", "--with-deps", "chromium",
     ]
-    assert options["env"]["PLAYWRIGHT_BROWSERS_PATH"] == str(webwatch.PLAYWRIGHT_BROWSERS_DIR)
+    installed_path = Path(options["env"]["PLAYWRIGHT_BROWSERS_PATH"])
+    assert installed_path.is_absolute()
+    assert installed_path == webwatch.PLAYWRIGHT_BROWSERS_DIR.resolve()
     assert verified == [True]

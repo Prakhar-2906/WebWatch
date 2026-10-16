@@ -28,9 +28,16 @@ def test_render_timeout_diagnostic_exposes_only_bounded_public_request_metadata(
 
 
 def test_chromium_launch_failure_logs_type_and_redacted_message(monkeypatch, caplog):
+    launch_options = []
+
     class Chromium:
+        executable_path = str(
+            webwatch.PLAYWRIGHT_BROWSERS_DIR / "chromium-1248" / "chrome-win64" / "chrome.exe"
+        )
+
         @staticmethod
-        def launch(**_kwargs):
+        def launch(**kwargs):
+            launch_options.append(kwargs)
             raise RuntimeError(
                 "launch failed at https://user:password@auth.example/private/page?token=topsecret "
                 "Authorization: Bearer api-secret"
@@ -60,6 +67,10 @@ def test_chromium_launch_failure_logs_type_and_redacted_message(monkeypatch, cap
     assert "launch failed at https://auth.example/[redacted]" in caplog.text
     for sensitive in ("user", "password", "/private/page", "topsecret", "api-secret"):
         assert sensitive not in caplog.text
+    assert launch_options[0]["headless"] is True
+    assert launch_options[0]["executable_path"] == str(
+        webwatch.playwright_headless_shell_path(Chromium.executable_path)
+    )
 
 
 def test_rendered_javascript_text_and_private_subresource_blocking(monkeypatch):
