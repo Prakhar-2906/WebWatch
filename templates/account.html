@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>WebWatch account</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}"><script src="{{ url_for('static', filename='account.js') }}" defer></script></head>
+<body class="auth-page"><main class="auth-card account-card"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true"><span></span></span><span>WebWatch</span></a>
+<h1>Account</h1><p id="account-email" class="intro"></p>
+<section id="invite-section"><h2>Invite a person</h2><p class="field-help">Invitations are sent to the email address you enter and expire after seven days.</p>
+<form id="invite-form"><label for="invite-email">Email address</label><input id="invite-email" type="email" autocomplete="email" required maxlength="254"><button class="primary-button" type="submit">Send invitation</button><p id="invite-message" class="form-feedback" role="status" aria-live="polite"></p></form></section>
+<button type="button" id="logout-button" class="secondary-button">Sign out</button></main></body></html>

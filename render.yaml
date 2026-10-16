@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: webwatch-free-test
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+    startCommand: gunicorn --config gunicorn.conf.py --bind 0.0.0.0:$PORT app:app
+    autoDeployTrigger: 'off'
+    envVars:
+      - key: WEBWATCH_SECRET_KEY
+        sync: false
+      - key: WEBWATCH_OWNER_SETUP_TOKEN
+        sync: false
+      - key: WEBWATCH_DATABASE
+        value: /tmp/webwatch.sqlite3
+      - key: WEBWATCH_TRUST_PROXY
+        value: "true"

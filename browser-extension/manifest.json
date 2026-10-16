@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "WebWatch Quick Add",
+  "version": "1.0.0",
+  "description": "Send the current public webpage to WebWatch for review.",
+  "permissions": ["activeTab"],
+  "action": {
+    "default_title": "Send page to WebWatch",
+    "default_popup": "popup.html"
+  }
+}

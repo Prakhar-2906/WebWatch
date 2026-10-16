@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f6f4" />
+    <meta name="description" content="Keep an eye on the webpages that matter to you." />
+    <title>WebWatch — Website change monitor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="WebWatch home">
+          <span class="brand-mark" aria-hidden="true"><span></span></span>
+          <span>WebWatch</span>
+        </a>
+        <details class="quick-menu">
+          <summary aria-label="Open navigation menu">Menu</summary>
+          <nav aria-label="Dashboard navigation">
+            <a href="#watchlist-heading">Watchlist</a>
+            <a href="#notification-heading">Serious events</a>
+            <a href="#schedule-heading">Automatic monitoring</a>
+            <a href="#alerts-heading">Email and webhook alerts</a>
+            <a href="#job-queue-heading">Check queue</a>
+            <button type="button" id="open-guide">Guide</button>
+          </nav>
+        </details>
+        <div class="header-tools">
+          <a class="account-link" href="/account">Account</a>
+          <span class="product-label">Website monitor</span>
+          <button class="hidden-nav" id="hidden-view-toggle" type="button" aria-pressed="false" aria-label="Open Hidden Websites" title="Open Hidden Websites">
+            <svg class="eye-open" aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M2 10s2.9-5 8-5 8 5 8 5-2.9 5-8 5-8-5-8-5Z"/><circle cx="10" cy="10" r="2.2"/></svg>
+            <svg class="eye-closed" aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M3 3l14 14M8.6 5.2A8.7 8.7 0 0 1 10 5c5.1 0 8 5 8 5a12 12 0 0 1-2.2 2.8M5.3 5.8C3.2 7.1 2 10 2 10s2.9 5 8 5c.8 0 1.5-.1 2.2-.4"/></svg>
+            <span class="hidden-nav-label">Hidden Websites</span>
+          </button>
+          <button class="theme-toggle" id="theme-toggle" type="button" role="switch" aria-checked="false" aria-label="Dark mode">
+            <span class="theme-toggle-label">Dark mode</span>
+            <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+          </button>
+        </div>
+      </header>
+
+      <main class="main-content">
+        <div class="page-heading">
+          <div>
+            <p class="eyebrow" id="view-eyebrow">YOUR WATCHLIST</p>
+            <h1 id="page-title">Websites</h1>
+            <p class="intro" id="page-intro">Track pages and see when their content changes.</p>
+          </div>
+        </div>
+
+        <section class="add-panel" id="add-panel" aria-labelledby="add-heading">
+          <div class="add-copy">
+            <h2 id="add-heading"><svg class="section-icon" aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7.25"/><path d="M2.9 10h14.2M10 2.8c1.8 1.9 2.7 4.3 2.7 7.2s-.9 5.3-2.7 7.2C8.2 15.3 7.3 12.9 7.3 10s.9-5.3 2.7-7.2Z"/></svg><span>Add a website</span></h2>
+          <p>Name the page, choose its own check interval, and paste a public URL.</p>
+          </div>
+          <form id="add-form" novalidate>
+            <div class="website-add-options">
+              <label for="website-name">Website name</label>
+              <input id="website-name" name="display_name" type="text" maxlength="80" placeholder="e.g. Project documentation" />
+              <label for="website-check-interval">Check interval</label>
+              <input id="website-check-interval" name="check_interval_minutes" type="number" min="15" max="1440" step="1" value="60" list="website-interval-presets" required />
+              <datalist id="website-interval-presets">
+                <option value="15" label="15 minutes"></option>
+                <option value="30" label="30 minutes"></option>
+                <option value="60" label="1 hour"></option>
+                <option value="180" label="3 hours"></option>
+                <option value="360" label="6 hours"></option>
+                <option value="720" label="12 hours"></option>
+                <option value="1440" label="24 hours"></option>
+              </datalist>
+              <span>minutes (15 min–24 hr; suggested intervals available)</span>
+            </div>
+            <label class="visually-hidden" for="website-url">Website URL</label>
+            <div class="input-row">
+              <div class="url-field">
+                <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7.25"/><path d="M2.9 10h14.2M10 2.8c1.8 1.9 2.7 4.3 2.7 7.2s-.9 5.3-2.7 7.2C8.2 15.3 7.3 12.9 7.3 10s.9-5.3 2.7-7.2Z"/></svg>
+                <input id="website-url" name="url" type="url" placeholder="https://example.com/page" autocomplete="url" inputmode="url" required />
+              </div>
+              <button type="submit" class="add-button"><span aria-hidden="true">+</span> Add website</button>
+            </div>
+          </form>
+          <div class="demo-invitation">
+            <button class="secondary-button" id="start-demo" type="button">Start local demo</button>
+            <span>Uses bundled pages; no external website is contacted.</span>
+          </div>
+        </section>
+        <p class="form-message" id="form-message" role="status" aria-live="polite"></p>
+
+        <section class="notification-panel" aria-labelledby="notification-heading">
+          <div class="notification-panel-heading">
+            <div>
+              <div class="notification-heading-title">
+                <h2 id="notification-heading">Serious event history</h2>
+                <span class="notification-total-count" id="notification-total-count">0 total</span>
+                <span class="notification-unread-count" id="notification-unread-count" aria-live="polite" aria-atomic="true" hidden></span>
+              </div>
+              <p>Availability transitions are recorded here. Ordinary page changes stay in the watchlist.</p>
+            </div>
+            <button class="secondary-button" id="enable-browser-notifications" type="button">Enable browser notifications</button>
+          </div>
+          <p class="browser-notification-status" id="browser-notification-status" role="status" aria-live="polite">Browser notifications are optional and currently off.</p>
+          <ol class="notification-list" id="notification-list" aria-live="polite">
+            <li class="notification-empty">Loading notification history…</li>
+          </ol>
+          <button class="notification-view-toggle" id="notification-view-toggle" type="button" aria-expanded="false" aria-label="View all serious events" hidden>View all events</button>
+        </section>
+
+        <section class="watchlist" aria-labelledby="watchlist-heading">
+          <div class="watchlist-header">
+            <div class="section-heading">
+              <h2 id="watchlist-heading">Watchlist</h2>
+              <span class="item-count" id="item-count">0 websites</span>
+            </div>
+            <div class="watchlist-heading-actions">
+              <button class="check-all-button" id="check-all" type="button">Check All</button>
+            </div>
+          </div>
+          <div class="check-all-progress" id="check-all-progress" hidden>
+            <progress id="check-all-meter" max="1" value="0"></progress>
+            <p id="check-all-status" role="status" aria-live="polite"></p>
+            <ul id="check-all-failures" aria-label="Websites that could not be checked" hidden></ul>
+          </div>
+          <div class="watch-stats" id="watch-stats" aria-live="polite" aria-label="Watchlist summary"></div>
+          <div class="watchlist-tools" id="watchlist-tools" hidden>
+            <div class="filter-field">
+              <label for="website-search">Search websites</label>
+              <div class="search-input-wrap">
+                <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><circle cx="8.7" cy="8.7" r="5.7"/><path d="m13 13 4 4"/></svg>
+                <input id="website-search" type="search" placeholder="Search by name or URL" autocomplete="off" />
+              </div>
+            </div>
+            <div class="filter-field status-filter-field">
+              <label for="status-filter">Status</label>
+              <select id="status-filter">
+                <option value="all">All statuses</option>
+                <option value="not_checked">Not checked</option>
+                <option value="baseline">Baseline saved</option>
+                <option value="changed">Content changed</option>
+                <option value="unchanged">No change</option>
+                <option value="error">Check failed</option>
+                <option value="blocked">Blocked</option>
+                <option value="rate_limited">Rate limited</option>
+                <option value="captcha">CAPTCHA / challenge</option>
+              </select>
+            </div>
+          </div>
+          <p class="match-summary" id="match-summary" role="status" aria-live="polite" hidden></p>
+          <div class="loading-state" id="loading-state" role="status">Loading your watchlist…</div>
+          <div class="load-error-state" id="load-error-state" role="alert" hidden>
+            <span>Could not load the watchlist.</span>
+            <button class="text-action" id="retry-watchlist" type="button">Try again</button>
+          </div>
+          <div id="website-list" class="website-list"></div>
+          <div id="empty-state" class="empty-state" hidden>
+            <div class="empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 40 40" fill="none"><rect x="5.75" y="7.75" width="28.5" height="24.5" rx="2.25"/><path d="M6 14h28M11 10.8h.1m3.9 0h.1M15 23h4l2.5-4 3 8 2-4H30"/></svg>
+            </div>
+            <h3 id="empty-state-heading">No websites yet</h3>
+            <p id="empty-state-copy">Your watchlist is ready. Add a page above to get started.</p>
+            <button class="text-action" id="focus-url" type="button">Add your first website <span aria-hidden="true">→</span></button>
+          </div>
+          <div id="filter-empty-state" class="filter-empty-state" hidden>
+            <p>No websites match these filters.</p>
+            <button class="text-action" id="clear-filters" type="button">Clear search and status</button>
+          </div>
+          <p class="implementation-note" id="implementation-note">Websites are saved by this app. Checks run manually or on the automatic schedule.</p>
+        </section>
+
+        <section class="schedule-panel" aria-labelledby="schedule-heading">
+          <div class="schedule-heading">
+            <div>
+              <h2 id="schedule-heading">Automatic monitoring</h2>
+              <p>Scheduled checks run while WebWatch is open. Each page keeps its own interval.</p>
+            </div>
+            <span class="schedule-state" id="schedule-state">Loading schedule…</span>
+          </div>
+          <div class="schedule-scope-note">
+            <span>Hidden websites are included</span>
+            <span aria-hidden="true">·</span>
+            <span>Local demo websites are excluded</span>
+          </div>
+          <form id="schedule-form" class="schedule-form">
+            <label class="schedule-enabled">
+              <input id="schedule-enabled" type="checkbox" />
+              <span>Run automatic checks</span>
+            </label>
+            <label class="schedule-interval" for="schedule-interval">
+              New page default interval
+              <input id="schedule-interval" type="number" min="1" max="10080" step="1" value="60" />
+              minutes
+            </label>
+            <button class="secondary-button" id="schedule-save" type="submit">Save automatic monitoring</button>
+          </form>
+          <div class="schedule-run-panel" id="schedule-run-panel" aria-live="polite" aria-label="Automatic monitoring run status">
+            <div class="schedule-run-heading">
+              <strong id="schedule-run-status">Loading run status…</strong>
+              <span><span class="run-time-label">Last run</span><time id="schedule-run-last">—</time></span>
+              <span><span class="run-time-label">Next scheduler pass</span><time id="schedule-run-next">—</time></span>
+            </div>
+            <div class="schedule-run-stats" id="schedule-run-stats" hidden></div>
+          </div>
+          <p class="schedule-status" id="schedule-status" role="status" aria-live="polite"></p>
+        </section>
+
+        <section class="schedule-panel alert-settings-panel" aria-labelledby="alerts-heading">
+          <div class="schedule-heading"><div><h2 id="alerts-heading">Email and webhook alerts</h2>
+            <p>Get alerts for meaningful changes and serious availability events. Change alerts are limited to one per page per hour.</p></div></div>
+          <form id="alert-settings-form" class="alert-settings-form">
+            <div class="alert-channel-grid">
+              <section class="alert-channel" aria-labelledby="alert-email-heading">
+                <div class="alert-channel-heading"><h3 id="alert-email-heading">Email</h3><p class="alert-setup-note" id="alert-email-setup" role="status">Add a recipient and configure SMTP on the WebWatch server.</p></div>
+                <label class="alert-option"><input id="alert-email-enabled" type="checkbox" /> Enable email alerts</label>
+                <label class="alert-field" for="alert-email-recipient">Recipient email
+                  <input id="alert-email-recipient" type="email" maxlength="254" autocomplete="email" placeholder="you@example.com" /></label>
+              </section>
+              <section class="alert-channel" aria-labelledby="alert-webhook-heading">
+                <div class="alert-channel-heading"><h3 id="alert-webhook-heading">Webhook</h3><p class="alert-setup-note" id="alert-webhook-setup" role="status">Add a public HTTPS destination. Saved URLs stay hidden.</p></div>
+                <label class="alert-option"><input id="alert-webhook-enabled" type="checkbox" /> Enable webhook alerts</label>
+                <label class="alert-field" for="alert-webhook-url">Webhook URL (HTTPS)
+                  <input id="alert-webhook-url" type="password" maxlength="2048" autocomplete="new-password" placeholder="https://…" /></label>
+                <label class="alert-field" for="alert-webhook-chat-id">Telegram chat ID (optional)
+                  <input id="alert-webhook-chat-id" type="text" maxlength="120" /></label>
+                <p class="alert-help">Discord uses its webhook URL; Telegram may also need a chat ID.</p>
+              </section>
+            </div>
+            <div class="alert-extra-options">
+              <span class="alert-extra-heading">Optional delivery options</span>
+              <label class="alert-option"><input id="alert-daily-digest-enabled" type="checkbox" /> Daily digest (once per UTC day)</label>
+              <label class="alert-option"><input id="ai-summary-enabled" type="checkbox" /> One-line AI change summaries</label>
+              <p class="alert-setup-note" id="ai-summary-setup">AI summaries need a provider key configured on the server.</p>
+            </div>
+            <div class="alert-actions">
+              <button class="add-button alert-save-button" id="alert-save" type="submit">Save alert settings</button>
+              <button class="secondary-button" id="alert-test" type="button">Send test alert</button>
+            </div>
+          </form>
+          <p class="alert-form-feedback" id="alert-settings-status" role="status" aria-live="polite"></p>
+        </section>
+        <section class="schedule-panel" aria-labelledby="job-queue-heading">
+          <div class="schedule-heading"><div><h2 id="job-queue-heading">Persistent check queue</h2>
+            <p>Recent check attempts recover after an application restart. Failed attempts do not replace the last good snapshot.</p></div></div>
+          <p class="schedule-status" id="job-queue-status" role="status" aria-live="polite">Loading check jobs…</p>
+          <ol class="job-queue-list" id="job-queue-list" aria-label="Recent check jobs"></ol>
+          <button class="text-action job-queue-toggle" id="job-queue-toggle" type="button" aria-expanded="false" aria-controls="job-queue-list" hidden>View more</button>
+        </section>
+      </main>
+      <footer class="footer"><span>WebWatch</span><span>Simple, local website tracking</span></footer>
+    </div>
+    <dialog class="history-dialog" id="history-dialog" aria-modal="true" aria-labelledby="history-dialog-title">
+      <div class="history-dialog-shell">
+        <header class="history-dialog-header">
+          <div class="history-dialog-heading">
+            <h2 id="history-dialog-title">Website history</h2>
+            <a class="history-dialog-url" id="history-dialog-url"></a>
+          </div>
+          <button class="history-dialog-close" id="history-dialog-close" type="button" aria-label="Close history">×</button>
+        </header>
+        <div class="history-dialog-content" id="history-dialog-content" aria-live="polite">
+          <p class="history-dialog-state">Select History on a website card to review its checks.</p>
+        </div>
+      </div>
+    </dialog>
+    <dialog class="history-dialog region-dialog" id="region-dialog" aria-modal="true" aria-labelledby="region-dialog-title">
+      <div class="history-dialog-shell">
+        <header class="history-dialog-header">
+          <div class="history-dialog-heading"><h2 id="region-dialog-title">Choose regions to monitor</h2><p class="history-dialog-url">Preview is rendered through WebWatch's protected browser route.</p></div>
+          <button class="history-dialog-close" id="region-dialog-close" type="button" aria-label="Close region picker">×</button>
+        </header>
+        <div class="history-dialog-content" id="region-dialog-content" aria-live="polite"><p class="history-dialog-state">Loading a safe page preview…</p></div>
+      </div>
+    </dialog>
+    <dialog class="history-dialog guide-dialog" id="guide-dialog" aria-labelledby="guide-title">
+      <div class="history-dialog-shell">
+        <header class="history-dialog-header"><div class="history-dialog-heading"><h2 id="guide-title">WebWatch guide</h2><p class="history-dialog-url">A local monitor for public webpages</p></div><button class="history-dialog-close" id="guide-close" type="button" aria-label="Close guide">×</button></header>
+        <div class="history-dialog-content guide-content">
+          <p>Use these sections when you need a quick reminder. WebWatch saves settings and page history in its local database.</p>
+          <details open><summary>Add and manage pages</summary><p>Add a public HTTP or HTTPS page with a display name and a 15-minute to 24-hour check interval. Adding saves the page; choose <strong>Check now</strong> to create its first successful baseline. Use each row’s edit and settings controls to change its name, interval, render mode, selectors, keyword alerts, numeric tracking, watched regions, or visibility. Hidden pages remain monitored; local demos are excluded from scheduled checks.</p></details>
+          <details><summary>Watchlist, checks, and automatic monitoring</summary><p>Search or filter the watchlist, open History, or run Check now. <strong>Check all</strong> shows progress and per-page results. Automatic monitoring runs only while the app is open; each page uses its own interval. The setting below it is only the default for newly added pages. Next scheduler pass is an estimate and may be delayed if the app is stopped or the computer sleeps.</p></details>
+          <details><summary>Statuses, serious events, and troubleshooting</summary><p>Baseline saved, No change, and Content changed describe successful checks. Network, DNS, timeout, HTTP denial, rate limit, CAPTCHA/challenge, blocked, or selector errors are failed attempts; they do not replace the last good snapshot or count as content changes. Fix the page URL or selector, check connectivity and the site’s availability, then retry later. WebWatch does not log in or bypass site restrictions. Expand a serious event to read its details; opening it marks it read. Browser notifications are optional.</p></details>
+          <details><summary>History, comparisons, and exports</summary><p>History can show all successful checks or only content changes. Open an entry for text changes and screenshots, then compare any two saved versions. Export history as JSON or readable HTML; the HTML page can be printed or saved as PDF from your browser. Snapshots and comparisons remain available according to the current database retention settings.</p></details>
+          <details><summary>Email, webhooks, and delivery queue</summary><p>Email needs a recipient plus SMTP host and sender settings on the server. Webhooks need an HTTPS destination; Telegram can also use a chat ID, while Discord uses its webhook URL. Save settings, then send a test. Webhook secrets stay hidden in the browser. Delivery options include a daily UTC digest and optional AI summaries. The queue shows recent check attempts, retries, and errors; alert delivery failures are recorded without exposing destination secrets. Content alerts are limited to one per page per hour.</p></details>
+          <details><summary>Keywords, numbers, and RSS</summary><p>Keyword-only alerts watch for configured phrases in page text. Numeric tracking uses a page’s configured selector and stores successful numeric observations; open its chart to review values over time. Each monitored page has an RSS feed for saved content versions.</p></details>
+          <details><summary>Browser extension</summary><p>Use Quick Add on the page currently open in your browser, review the detected URL and proposed name, then choose Review in WebWatch to submit it in the app. Manage monitored pages opens the WebWatch watchlist. The extension does not submit until you review and confirm.</p></details>
+          <details><summary>AI summaries and setup</summary><p>AI summaries are optional and use a provider key configured on the server; page excerpts are sent only when summaries are enabled and the provider is configured. Without a key, WebWatch uses its tested fallback summary. Live provider-generated summaries have not been verified in this environment because no key is configured.</p></details>
+          <p class="guide-limitation">WebWatch checks public pages using its protected rendering path. It preserves your last successful snapshot when a check fails and does not bypass access controls.</p>
+        </div>
+      </div>
+    </dialog>
+    <aside class="notification-toast" id="notification-toast" role="alert" aria-live="assertive" aria-atomic="true" hidden>
+      <div class="notification-toast-mark" aria-hidden="true">!</div>
+      <div class="notification-toast-content">
+        <p class="notification-toast-title" id="notification-toast-title"></p>
+        <p class="notification-toast-meta" id="notification-toast-meta"></p>
+        <p class="notification-toast-explanation" id="notification-toast-explanation"></p>
+      </div>
+      <button class="notification-toast-close" id="notification-toast-close" type="button" aria-label="Dismiss notification">×</button>
+    </aside>
+  </body>
+</html>

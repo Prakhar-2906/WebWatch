@@ -1,0 +1,67 @@
+# Python virtual environments and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Test and tool caches
+.pytest_cache/
+.pytest-*/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local application data and SQLite files
+instance/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+*.sqlite3-journal
+*.sqlite3.backup
+*.sqlite.backup
+*.db.backup
+*.backup
+*.bak
+backup/
+backups/
+
+# Local credentials and environment configuration
+.env
+.env.*
+!.env.example
+.envrc
+*.env
+.secrets/
+secrets/
+credentials/
+secrets.json
+credentials.json
+*credentials*.json
+service-account*.json
+*.secret.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+
+# Logs and temporary/editor/OS files
+*.log
+*.log.*
+*.trace
+*.tmp
+.audit-tmp/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

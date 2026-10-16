@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebWatch history — {{ website.display_name or website.url }}</title>
+    <style>
+      :root { color-scheme: light; font: 15px/1.5 system-ui, sans-serif; color: #252b33; background: #f6f6f2; }
+      body { max-width: 900px; margin: 32px auto; padding: 0 22px; }
+      header, article { padding: 18px; border: 1px solid #d6dadd; border-radius: 7px; background: white; }
+      header { margin-bottom: 14px; }
+      h1 { margin: 0; font-size: 22px; }
+      header p, time { color: #68737d; overflow-wrap: anywhere; }
+      article { margin-top: 9px; }
+      article h2 { margin: 0; font-size: 14px; }
+      .diff { white-space: pre-wrap; overflow-wrap: anywhere; }
+      @media print { body { max-width: none; margin: 0; } header, article { break-inside: avoid; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>{{ website.display_name or (website.url | replace('https://', '') | replace('http://', '')) }}</h1>
+      <p>{% if source_url %}<a href="{{ source_url }}" target="_blank" rel="noopener noreferrer">{{ website.url }}</a>{% else %}{{ website.url }}{% endif %}</p>
+      <p>Recent successful snapshot comparisons · Use your browser’s Print command to save as PDF.</p>
+    </header>
+    {% for entry in history | reverse %}
+      <article{% if entry.id %} id="snapshot-{{ entry.id }}"{% endif %}>
+        <h2>{{ entry.status | title }}</h2>
+        <time datetime="{{ entry.checked_at }}">{{ entry.checked_at }}</time>
+        {% if entry.added_content %}<p><strong>Added</strong></p><p class="diff">{{ entry.added_content }}</p>{% endif %}
+        {% if entry.removed_content %}<p><strong>Removed</strong></p><p class="diff">{{ entry.removed_content }}</p>{% endif %}
+        {% if entry.status == 'baseline' %}<p>First successful snapshot; no earlier page was available for comparison.</p>{% endif %}
+      </article>
+    {% else %}
+      <article>No successful checks have been recorded.</article>
+    {% endfor %}
+  </body>
+</html>

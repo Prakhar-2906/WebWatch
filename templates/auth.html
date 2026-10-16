@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark"><title>WebWatch account</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <script src="{{ url_for('static', filename='auth.js') }}" defer></script>
+</head>
+<body class="auth-page" data-mode="{{ mode }}">
+  <main class="auth-card">
+    <a class="brand" href="/login"><span class="brand-mark" aria-hidden="true"><span></span></span><span>WebWatch</span></a>
+    <h1 id="auth-title">{{ {'login':'Sign in','setup':'Set up the owner account','invite':'Accept your invitation'}[mode] }}</h1>
+    <p id="auth-intro" class="intro"></p>
+    <form id="auth-form" novalidate>
+      <label for="email">Email address</label><input id="email" name="email" type="email" autocomplete="email" required maxlength="254">
+      {% if mode == 'setup' %}<label for="setup-token">Authorized owner setup token</label><input id="setup-token" name="setup-token" type="password" autocomplete="off" required>{% endif %}
+      {% if mode == 'invite' %}<label for="invitation-token">Invitation code</label><input id="invitation-token" name="invitation-token" type="password" autocomplete="off" required>{% endif %}
+      {% if mode != 'login' %}<label for="password">Create a password</label><input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required><p class="field-help">Use at least 12 characters.</p>{% else %}<label for="password">Password</label><input id="password" name="password" type="password" autocomplete="current-password" required>{% endif %}
+      <button class="primary-button" type="submit" id="auth-submit">Continue</button>
+      <p id="auth-message" class="form-feedback" role="status" aria-live="polite"></p>
+    </form>
+    <nav class="auth-links" aria-label="Account links"><a id="auth-login-link" href="/login">Sign in</a><a id="auth-setup-link" href="/setup">Owner setup</a><a href="/invite">Accept invitation</a></nav>
+    <p class="field-help">Password recovery is unavailable until secure email delivery is configured.</p>
+  </main>
+</body>
+</html>
