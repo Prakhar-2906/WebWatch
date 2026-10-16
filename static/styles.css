@@ -737,6 +737,10 @@ html { scroll-behavior: smooth; scroll-padding-top: 18px; }
 .auth-links { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; font-size: .92rem; }
 .auth-links a, .account-link { color: var(--accent); }
 .auth-card .field-help { margin: 0; font-size: .88rem; color: var(--muted); }
+.demo-credentials { margin-top: 22px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-muted); }
+.demo-credentials h2 { margin: 0 0 8px; font-size: 1rem; }
+.demo-credentials p { margin: 4px 0; font-size: .92rem; }
+.demo-credentials code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .form-feedback { min-height: 1.3em; margin: 2px 0 0; color: var(--danger); overflow-wrap: anywhere; }
 .account-card #logout-button { margin-top: 28px; }
 [hidden] { display: none !important; }

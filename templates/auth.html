@@ -19,6 +19,13 @@
       <button class="primary-button" type="submit" id="auth-submit">Continue</button>
       <p id="auth-message" class="form-feedback" role="status" aria-live="polite"></p>
     </form>
+    {% if mode == 'login' %}
+    <section class="demo-credentials" aria-labelledby="demo-credentials-title">
+      <h2 id="demo-credentials-title">Demo Credentials</h2>
+      <p><strong>Email:</strong> <code>test123@gmail.com</code></p>
+      <p><strong>Password:</strong> <code>test000</code></p>
+    </section>
+    {% endif %}
     <nav class="auth-links" aria-label="Account links"><a id="auth-login-link" href="/login">Sign in</a><a id="auth-setup-link" href="/setup">Owner setup</a><a href="/invite">Accept invitation</a></nav>
     <p class="field-help">Password recovery is unavailable until secure email delivery is configured.</p>
   </main>

@@ -41,7 +41,8 @@ from requests.exceptions import (
 from requests.adapters import HTTPAdapter
 from urllib3.exceptions import NewConnectionError
 from werkzeug.middleware.proxy_fix import ProxyFix
-from auth import auth_blueprint, authenticated_user, csrf_request_valid, migrate_auth_schema
+from auth import (auth_blueprint, authenticated_user, csrf_request_valid,
+                  migrate_auth_schema, provision_demo_account)
 
 app = Flask(__name__)
 DEFAULT_DATABASE_PATH = Path(app.instance_path) / "webwatch.sqlite3"
@@ -558,6 +559,12 @@ def init_db():
         for row in db.execute("SELECT id FROM websites").fetchall():
             enforce_site_retention(db, row["id"])
     migrate_auth_schema(app.config["DATABASE"])
+    if os.environ.get("WEBWATCH_DEMO_ACCOUNT", "").strip().lower() in {"1", "true", "yes"}:
+        provision_demo_account(
+            app.config["DATABASE"],
+            os.environ.get("WEBWATCH_DEMO_EMAIL", ""),
+            os.environ.get("WEBWATCH_DEMO_PASSWORD", ""),
+        )
     _initialized_database_paths.add(str(Path(app.config["DATABASE"]).resolve()))
 
 

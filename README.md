@@ -193,4 +193,20 @@ The schema-v2 migration only adds an owner reference to grouped connectivity inc
 
 The local database path is unchanged by default (`instance/webwatch.sqlite3`). Set `WEBWATCH_DATABASE` to select another SQLite file; the Render test config uses `/tmp/webwatch.sqlite3`. Free Render filesystems are ephemeral, so its test database and test account may disappear after a restart or deploy. **Do not expect it to contain your local websites/history**, and do not point the service at a copy you have not verified. This configuration does not create backups. Continuous scheduled monitoring is not guaranteed: free web services can sleep when idle, so the in-process scheduler pauses with the service. Render documents that free services spin down after 15 minutes of inactivity and that persistent disks are not available on the free plan. [Free service limits](https://render.com/docs/free), [persistent disk limits](https://render.com/docs/disks).
 
+### Optional demo account
+
+The sign-in page displays the demo credentials `test123@gmail.com` / `test000`. To create that account in the service's actual SQLite database, configure these environment variables in the hosting service and restart/redeploy it:
+
+```text
+WEBWATCH_DEMO_ACCOUNT=true
+WEBWATCH_DEMO_EMAIL=test123@gmail.com
+WEBWATCH_DEMO_PASSWORD=test000
+```
+
+Provisioning runs during database initialization and uses the same path as `WEBWATCH_DATABASE`. It hashes the password with the existing Argon2id hasher, creates a `member` account, and does nothing if that normalized email already exists; it does not reset an existing password. It is an environment-controlled startup operation, not a public account-creation endpoint. The visible demo password is intentionally public, so do not use this account for private monitoring data. Its pages and history remain scoped to its own account.
+
+For a new database, set `WEBWATCH_SECRET_KEY` as usual. `WEBWATCH_OWNER_SETUP_TOKEN` is still needed only if you also want to create the separate first owner through `/setup`; set it to a private random value of at least 32 characters and remove it after owner setup. The demo member does not consume the owner setup token, claim legacy unowned data, or gain owner privileges. If a database already has an owner, `/setup` remains closed as before.
+
+The current Voroa setting `WEBWATCH_DATABASE=/tmp/webwatch.sqlite3` selects the database the provisioner will use, but `/tmp` may be ephemeral. The demo account and other database contents can disappear after restart or redeployment if Voroa does not preserve that path. A persistent database location would improve durability, but changing the path requires planning a safe migration of any existing data; this change does not alter it.
+
 To create a temporary test service from Render's dashboard, select the Python runtime and use the build and start commands in `render.yaml`. The build installs the pinned Python packages and the matching Playwright Chromium build plus its Linux system dependencies. Render supplies `PORT`; Gunicorn binds to it. Set a fresh `WEBWATCH_SECRET_KEY` in Render's environment. Because the free service starts with a separate empty database, set a temporary `WEBWATCH_OWNER_SETUP_TOKEN` for its first owner setup, then remove that token after setup. Configure SMTP environment variables only if invitation or email delivery is being tested. Keep secrets in Render's environment settings, never in Git. Automatic deployment is disabled in the blueprint. Do not use a free test service as the durable home of WebWatch data.

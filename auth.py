@@ -101,6 +101,36 @@ def _password_ok(password):
     return isinstance(password, str) and 12 <= len(password) <= 1024 and len(password.encode("utf-8")) <= 1024
 
 
+def provision_demo_account(database_path, email, password):
+    """Create the configured demo member once, without changing existing accounts."""
+    normalized = _normalize_email(email)
+    if normalized is None or not isinstance(password, str) or not password or len(password.encode("utf-8")) > 1024:
+        raise ValueError("Demo account email or password configuration is invalid.")
+    path = Path(database_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, timeout=30)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        existing = db.execute(
+            "SELECT id FROM users WHERE email_normalized = ?", (normalized,)
+        ).fetchone()
+        if existing:
+            db.commit()
+            return existing[0]
+        cursor = db.execute(
+            "INSERT INTO users(email, email_normalized, password_hash, role, created_at) "
+            "VALUES (?, ?, ?, 'member', ?)",
+            (email.strip(), normalized, password_hasher.hash(password), _iso(_now())),
+        )
+        db.commit()
+        return cursor.lastrowid
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def _csrf_valid():
     cookie = request.cookies.get(CSRF_COOKIE, "")
     supplied = request.headers.get("X-CSRF-Token", "")
@@ -175,9 +205,10 @@ def auth_status():
     db = _database()
     try:
         count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        owner_count = db.execute("SELECT COUNT(*) FROM users WHERE role = 'owner'").fetchone()[0]
         return _json({
             "account_exists": count > 0,
-            "initial_setup_available": count == 0 and _secret() is not None
+            "initial_setup_available": owner_count == 0 and _secret() is not None
             and len(os.environ.get("WEBWATCH_OWNER_SETUP_TOKEN", "")) >= 32,
             "authentication_available": _secret() is not None,
             "password_recovery_available": False,
@@ -214,7 +245,7 @@ def setup_first_owner():
     now = _now()
     try:
         db.execute("BEGIN IMMEDIATE")
-        if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] != 0:
+        if db.execute("SELECT COUNT(*) FROM users WHERE role = 'owner'").fetchone()[0] != 0:
             db.rollback()
             return _json({"error": "Owner setup is unavailable."}, 404)
         cursor = db.execute(
