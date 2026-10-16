@@ -46,7 +46,31 @@ from auth import (auth_blueprint, authenticated_user, csrf_request_valid,
                   provision_demo_account)
 
 app = Flask(__name__)
+# Keep Playwright's browser binaries inside the application tree so Voroa's
+# build artifact carries them into the running service. The install helper
+# uses this same path and Python environment.
+PLAYWRIGHT_BROWSERS_DIR = Path(__file__).resolve().parent / ".playwright-browsers"
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
 DEFAULT_DATABASE_PATH = Path(app.instance_path) / "webwatch.sqlite3"
+
+
+def verify_playwright_browser():
+    """Fail deployment startup clearly when the pinned Chromium shell is absent."""
+    from importlib.metadata import version as package_version
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        executable = Path(playwright.chromium.executable_path)
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise RuntimeError(
+            "Playwright Chromium headless-shell executable is missing or not executable: "
+            f"{executable}. Rebuild the deployment with: python tools/install_playwright_browser.py"
+        )
+    render_logger.info(
+        "Playwright browser verified (package=%s, executable=%s)",
+        package_version("playwright"), executable,
+    )
+    return executable
 
 
 def configured_database_path(default_path, override=None):
@@ -131,6 +155,8 @@ _scheduler_thread_guard = threading.Lock()
 _scheduler_thread = None
 _scheduler_stop = threading.Event()
 _render_cache = contextvars.ContextVar("webwatch_render_cache", default=None)
+_shared_render_flights_guard = threading.Lock()
+_shared_render_flights = {}
 _browser_render_slots = threading.BoundedSemaphore(1)
 BROWSER_RENDER_SLOT_WAIT_SECONDS = 40
 render_logger = logging.getLogger("webwatch.render")
@@ -1149,7 +1175,7 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
         raise ValueError(
-            "JavaScript rendering is unavailable. Install the project dependencies and run 'python -m playwright install chromium'."
+            "JavaScript rendering is unavailable. Install the project dependencies and run 'python tools/install_playwright_browser.py'."
         ) from exc
 
     request_count = 0
@@ -2140,24 +2166,28 @@ def _get_website_check_lock(website_id):
 def run_scheduled_checks(owner_id=None):
     """Check every real website through check_site; return None if another run is active."""
     if owner_id is None:
-        with app.app_context():
-            with get_db() as db:
-                owners = [row[0] for row in db.execute("SELECT DISTINCT owner_id FROM websites WHERE owner_id IS NOT NULL ORDER BY owner_id")]
-        if not owners:
-            return {"skipped": True, "total": 0, "successful": 0, "failed": 0, "changed": 0}
-        results = [run_scheduled_checks(account_id) for account_id in owners]
-        completed_results = [item for item in results if item is not None]
-        if len(completed_results) == 1:
-            return completed_results[0]
-        if not completed_results:
-            return None
-        return {key: sum((item or {}).get(key, 0) for item in completed_results)
-                for key in ("total", "completed", "successful", "failed", "changed")} | {
-                    "skipped": all((item or {}).get("skipped", False) for item in completed_results),
-                    "failures": [failure for item in completed_results for failure in (item or {}).get("failures", [])]}
+        with render_cycle():
+            with app.app_context():
+                with get_db() as db:
+                    owners = [row[0] for row in db.execute(
+                        "SELECT DISTINCT owner_id FROM websites WHERE owner_id IS NOT NULL ORDER BY owner_id")]
+            if not owners:
+                return {"skipped": True, "total": 0, "successful": 0, "failed": 0, "changed": 0}
+            results = [run_scheduled_checks(account_id) for account_id in owners]
+            completed_results = [item for item in results if item is not None]
+            if len(completed_results) == 1:
+                return completed_results[0]
+            if not completed_results:
+                return None
+            return {key: sum((item or {}).get(key, 0) for item in completed_results)
+                    for key in ("total", "completed", "successful", "failed", "changed")} | {
+                        "skipped": all((item or {}).get("skipped", False) for item in completed_results),
+                        "failures": [failure for item in completed_results for failure in (item or {}).get("failures", [])]}
     if not _scheduled_run_lock.acquire(blocking=False):
         return None
-    render_cache_token = _render_cache.set({})
+    render_cache_token = None
+    if _render_cache.get() is None:
+        render_cache_token = _render_cache.set({})
     total = completed = successful = failed = changed = 0
     failures = []
     run_started = False
@@ -2183,7 +2213,6 @@ def run_scheduled_checks(owner_id=None):
                     continue
                 completed += 1
                 try:
-                    reserve_domain_slot(site["url"])
                     result = check_site(website_id, wait_for_lock=True)
                     if isinstance(result, tuple):
                         response = result[0]
@@ -2210,7 +2239,6 @@ def run_scheduled_checks(owner_id=None):
                                              next_run_at=retry_at.isoformat(timespec="seconds"))
                         time.sleep(min((retry_at - datetime.now(timezone.utc)).total_seconds(),
                                        JOB_RETRY_BASE_SECONDS * (2 ** (retry_number - 1))))
-                        reserve_domain_slot(site["url"])
                         result = check_site(website_id, wait_for_lock=True)
                         if isinstance(result, tuple):
                             response = result[0]
@@ -2287,7 +2315,8 @@ def run_scheduled_checks(owner_id=None):
             "error": "The run could not finish; see the WebWatch server log.",
         }
     finally:
-        _render_cache.reset(render_cache_token)
+        if render_cache_token is not None:
+            _render_cache.reset(render_cache_token)
         if run_started:
             run_status = "failed" if fatal_error else ("partial_failure" if failed else "completed")
             finished_at = utc_now()
@@ -2336,6 +2365,12 @@ def scheduler_loop():
 
 
 def run_due_schedule():
+    """Run scheduled and retried jobs with a shared fetch cache for this poll."""
+    with render_cycle():
+        return _run_due_schedule_cycle()
+
+
+def _run_due_schedule_cycle():
     """Run each account's due sites and durable jobs with that account's settings."""
     ensure_db_initialized()
     cleanup_expired_guests_if_due()
@@ -2351,7 +2386,7 @@ def run_due_schedule():
                 settings = schedule_settings(db, owner_id)
                 due = due_website_rows(db, owner_id=owner_id)
                 pending = db.execute(
-                    "SELECT j.id, j.website_id, j.attempts, j.status, j.next_run_at, w.url "
+                    "SELECT j.id, j.website_id, j.attempts, j.status, j.next_run_at "
                     "FROM check_jobs j JOIN websites w ON w.id = j.website_id "
                     "WHERE j.owner_id = ? AND j.status IN ('queued', 'retry') AND j.next_run_at <= ? "
                     "ORDER BY j.id LIMIT 20", (owner_id, utc_now()),
@@ -2367,7 +2402,6 @@ def run_due_schedule():
                                 attempts = claim_check_job(db, job["id"])
                             if attempts is None:
                                 continue
-                            reserve_domain_slot(job["url"])
                             # check_site builds Flask JSON responses, so retries processed
                             # by the background scheduler need an application context too.
                             with app.app_context():
@@ -2885,9 +2919,7 @@ def check_website(website_id):
         attempt = claim_check_job(db, job_id)
         if attempt is None:
             return jsonify(error="A check for this website is already queued or running.", job_id=job_id), 409
-        site_url = site["url"]
     try:
-        reserve_domain_slot(site_url)
         result = check_site(website_id)
         response = result[0] if isinstance(result, tuple) else result
         status_code = result[1] if isinstance(result, tuple) and len(result) > 1 else getattr(response, "status_code", 200)
@@ -2943,6 +2975,71 @@ def normalized_render_key(url, selectors):
             json.dumps(selectors, sort_keys=True, separators=(",", ":")))
 
 
+@contextmanager
+def render_cycle():
+    """Share successful compatible renders only for the lifetime of one cycle."""
+    if _render_cache.get() is not None:
+        yield _render_cache.get()
+        return
+    token = _render_cache.set({})
+    try:
+        yield _render_cache.get()
+    finally:
+        _render_cache.reset(token)
+
+
+def shared_render_result(key, fetch):
+    """Reuse successful renders for one scheduler cycle and coalesce in-flight calls.
+
+    The cycle cache is deliberately scoped by the caller. Manual requests outside
+    a cycle share only while a compatible fetch is actively in flight, so a later
+    manual check cannot silently reuse stale content. Failures are never cached.
+    """
+    cycle_cache = _render_cache.get()
+    if cycle_cache is not None and key in cycle_cache:
+        return cycle_cache[key]
+
+    with _shared_render_flights_guard:
+        flight = _shared_render_flights.get(key)
+        leader = flight is None
+        if leader:
+            flight = {"event": threading.Event(), "waiters": 0}
+            _shared_render_flights[key] = flight
+        else:
+            flight["waiters"] += 1
+
+    if leader:
+        try:
+            result = fetch()
+        except Exception as exc:
+            flight["error_type"] = type(exc)
+            flight["error_args"] = exc.args
+            with _shared_render_flights_guard:
+                if _shared_render_flights.get(key) is flight:
+                    del _shared_render_flights[key]
+                flight["event"].set()
+            raise
+        if cycle_cache is not None:
+            cycle_cache[key] = result
+        with _shared_render_flights_guard:
+            flight["result"] = result
+            if _shared_render_flights.get(key) is flight:
+                del _shared_render_flights[key]
+            flight["event"].set()
+        return result
+
+    flight["event"].wait()
+    if "error_type" in flight:
+        try:
+            raise flight["error_type"](*flight["error_args"])
+        except Exception:
+            raise
+    result = flight["result"]
+    if cycle_cache is not None:
+        cycle_cache[key] = result
+    return result
+
+
 def _check_site_unlocked(website_id):
     """Check any website; hidden state does not affect monitoring eligibility."""
     with get_db() as db:
@@ -2964,22 +3061,20 @@ def _check_site_unlocked(website_id):
                 }
                 cache_key = (*normalized_render_key(site["url"], selectors),
                              site["max_document_size_kib"])
-                cache = _render_cache.get()
-                if cache is not None and cache_key in cache:
-                    rendered, text = cache[cache_key]
-                else:
+                def fetch_rendered_page():
+                    reserve_domain_slot(site["url"])
                     document_limit_options = (
                         {"max_document_size_kib": site["max_document_size_kib"]}
                         if site["max_document_size_kib"] != DEFAULT_DOCUMENT_LIMIT_KIB else {}
                     )
-                    rendered = (render_page_text(
-                                    site["url"], selectors=selectors, **document_limit_options,
-                                )
-                                if selectors["watched"] or selectors["ignored"] or selectors["numeric"]
-                                else render_page_text(site["url"], **document_limit_options))
-                    text = str(rendered)
-                    if cache is not None:
-                        cache[cache_key] = (rendered, text)
+                    page = (render_page_text(
+                                site["url"], selectors=selectors, **document_limit_options,
+                            )
+                            if selectors["watched"] or selectors["ignored"] or selectors["numeric"]
+                            else render_page_text(site["url"], **document_limit_options))
+                    return page, str(page)
+
+                rendered, text = shared_render_result(cache_key, fetch_rendered_page)
         except WebsiteCaptchaError as exc:
             checked_at = utc_now()
             db.execute(

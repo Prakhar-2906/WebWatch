@@ -10,9 +10,10 @@ timeout = 90
 
 
 def post_worker_init(worker):
-    """Start the scheduler in the sole worker, after Gunicorn forks it."""
-    from app import start_scheduler
+    """Verify the renderer, then start the scheduler in the sole worker."""
+    from app import start_scheduler, verify_playwright_browser
 
+    verify_playwright_browser()
     start_scheduler()
 
 

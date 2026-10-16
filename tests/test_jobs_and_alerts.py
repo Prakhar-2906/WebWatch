@@ -215,6 +215,173 @@ def test_same_normalized_render_settings_fetch_once_and_distribute_history(jobs_
             (first_id, "Shared public content"), (second_id, "Shared public content")]
 
 
+def test_concurrent_checks_for_different_owners_share_one_inflight_fetch(jobs_client, monkeypatch):
+    client, database = jobs_client
+    first_id = add_site(client, "https://1.1.1.1/")
+    with sqlite3.connect(database) as db:
+        db.execute(
+            "INSERT INTO users (email, email_normalized, password_hash, role, created_at) "
+            "VALUES ('member@example.test', 'member@example.test', 'unused-test-hash', 'member', ?)",
+            (webwatch.utc_now(),),
+        )
+        second_owner = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.execute(
+            "INSERT INTO websites (url, created_at, display_name, owner_id) VALUES (?, ?, ?, ?)",
+            ("https://1.1.1.1/", webwatch.utc_now(), "Other owner's same URL", second_owner),
+        )
+        second_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    fetch_started = threading.Event()
+    release_fetch = threading.Event()
+    both_ready = threading.Barrier(2)
+    requests = []
+    results = {}
+    errors = []
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"Content-Type": "text/html"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def iter_content(chunk_size):
+            assert chunk_size == 16384
+            yield b"<html><body>Shared concurrent content</body></html>"
+
+    class FakeSession:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def mount(_prefix, _adapter):
+            return None
+
+        def get(self, url, **kwargs):
+            requests.append((url, kwargs))
+            fetch_started.set()
+            assert release_fetch.wait(timeout=3)
+            return FakeResponse()
+
+    def fake_render(url, **_kwargs):
+        body, _headers, _final_url = webwatch.fetch_public_resource(
+            url, accept="text/html,application/xhtml+xml",
+            max_bytes=webwatch.MAX_RESPONSE_BYTES, require_html=True,
+        )
+        return webwatch.extract_readable_text(body)
+
+    def check(website_id):
+        try:
+            with webwatch.app.app_context():
+                both_ready.wait(timeout=3)
+                response = webwatch.check_site(website_id)
+                results[website_id] = response.status_code
+        except Exception as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(webwatch, "render_page_text", fake_render)
+    monkeypatch.setattr(webwatch.requests, "Session", FakeSession)
+    workers = [threading.Thread(target=check, args=(site_id,)) for site_id in (first_id, second_id)]
+    for worker in workers:
+        worker.start()
+    assert fetch_started.wait(timeout=3)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        with webwatch._shared_render_flights_guard:
+            waiting = any(flight["waiters"] for flight in webwatch._shared_render_flights.values())
+        if waiting:
+            break
+        time.sleep(0.01)
+    assert waiting, "the second owner's check should join the in-flight shared fetch"
+    release_fetch.set()
+    for worker in workers:
+        worker.join(timeout=3)
+
+    assert not errors
+    assert all(not worker.is_alive() for worker in workers)
+    assert results == {first_id: 200, second_id: 200}
+    assert [url for url, _kwargs in requests] == ["https://1.1.1.1/"]
+    assert requests[0][1]["allow_redirects"] is False
+    assert requests[0][1]["stream"] is True
+    with sqlite3.connect(database) as db:
+        assert db.execute("SELECT website_id, content_text FROM snapshots ORDER BY website_id").fetchall() == [
+            (first_id, "Shared concurrent content"), (second_id, "Shared concurrent content")]
+
+
+def test_shared_cycle_does_not_reuse_render_for_incompatible_selectors(jobs_client, monkeypatch):
+    client, database = jobs_client
+    first_id = add_site(client, "https://1.1.1.1/")
+    with sqlite3.connect(database) as db:
+        db.execute("INSERT INTO websites (url, created_at, display_name, owner_id) VALUES (?, ?, ?, 1)",
+                   ("https://1.1.1.1:443#ignored-fragment", webwatch.utc_now(), "Selected region"))
+        second_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.execute("UPDATE websites SET watched_selectors='[\"main\"]', max_document_size_kib=768 WHERE id=?",
+                   (second_id,))
+    calls = []
+    monkeypatch.setattr(webwatch, "reserve_domain_slot", lambda _url: None)
+    monkeypatch.setattr(webwatch, "render_page_text", lambda url, **kwargs: (calls.append((url, kwargs)) or "Page"))
+    cache_token = webwatch._render_cache.set({})
+    try:
+        assert client.post(f"/api/websites/{first_id}/check").status_code == 200
+        assert client.post(f"/api/websites/{second_id}/check").status_code == 200
+    finally:
+        webwatch._render_cache.reset(cache_token)
+
+    assert len(calls) == 2
+    assert calls[0][1] == {}
+    assert calls[1][1]["selectors"]["watched"] == ["main"]
+    assert calls[1][1]["max_document_size_kib"] == 768
+
+
+def test_shared_fetch_failures_are_not_cached_across_retry_attempts():
+    cache_token = webwatch._render_cache.set({})
+    calls = []
+
+    def fail_once():
+        calls.append(True)
+        if len(calls) == 1:
+            raise webwatch.WebsiteTemporaryError("temporary test failure")
+        return "recovered content"
+
+    try:
+        key = ("https://1.1.1.1/", "[]", 512)
+        with pytest.raises(webwatch.WebsiteTemporaryError, match="temporary test failure"):
+            webwatch.shared_render_result(key, fail_once)
+        assert webwatch.shared_render_result(key, fail_once) == "recovered content"
+    finally:
+        webwatch._render_cache.reset(cache_token)
+    assert len(calls) == 2
+
+
+def test_shared_results_do_not_cross_monitoring_cycles():
+    calls = []
+
+    def fetch():
+        calls.append(True)
+        return f"cycle {len(calls)}"
+
+    key = ("https://1.1.1.1/", "[]", 512)
+    with webwatch.render_cycle():
+        assert webwatch.shared_render_result(key, fetch) == "cycle 1"
+        assert webwatch.shared_render_result(key, fetch) == "cycle 1"
+    with webwatch.render_cycle():
+        assert webwatch.shared_render_result(key, fetch) == "cycle 2"
+    assert len(calls) == 2
+
+
 def test_keyword_only_alerts_filter_meaningful_change_and_rss_lists_versions(jobs_client, monkeypatch):
     client, database = jobs_client
     site_id = add_site(client, "https://1.1.1.1/")

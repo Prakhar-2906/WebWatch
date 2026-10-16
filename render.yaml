@@ -3,8 +3,8 @@ services:
     name: webwatch-free-test
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
-    startCommand: gunicorn --config gunicorn.conf.py --bind 0.0.0.0:$PORT app:app
+    buildCommand: python -m pip install -r requirements.txt && python tools/install_playwright_browser.py
+    startCommand: python -m gunicorn --config gunicorn.conf.py --bind 0.0.0.0:$PORT app:app
     autoDeployTrigger: 'off'
     envVars:
       - key: WEBWATCH_SECRET_KEY

@@ -3,6 +3,8 @@
 import json
 import runpy
 import sqlite3
+import sys
+from types import ModuleType
 from http.cookies import SimpleCookie
 from pathlib import Path
 
@@ -164,9 +166,54 @@ def test_gunicorn_configuration_uses_one_worker_and_scheduler_hooks(monkeypatch)
     assert config["threads"] == 4
 
     starts, stops = [], []
+    checks = []
+    monkeypatch.setattr(webwatch, "verify_playwright_browser", lambda: checks.append(True))
     monkeypatch.setattr(webwatch, "start_scheduler", lambda: starts.append(True))
     monkeypatch.setattr(webwatch, "stop_scheduler", lambda: stops.append(True))
     config["post_worker_init"](object())
     config["worker_exit"](object(), object())
+    assert checks == [True]
     assert starts == [True]
     assert stops == [True]
+
+
+def test_playwright_deployment_check_rejects_missing_headless_shell(monkeypatch, tmp_path):
+    missing_executable = tmp_path / "chromium_headless_shell" / "chrome-headless-shell"
+
+    class FakePlaywrightContext:
+        chromium = type("Chromium", (), {"executable_path": str(missing_executable)})()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    sync_api = ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = FakePlaywrightContext
+    playwright_package = ModuleType("playwright")
+    playwright_package.__path__ = []
+    monkeypatch.setitem(sys.modules, "playwright", playwright_package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    with pytest.raises(RuntimeError, match="headless-shell executable is missing") as error:
+        webwatch.verify_playwright_browser()
+    assert str(missing_executable) in str(error.value)
+
+
+def test_browser_installer_uses_running_python_and_shared_runtime_cache(monkeypatch):
+    script_path = Path(__file__).parents[1] / "tools" / "install_playwright_browser.py"
+    install_calls, verified = [], []
+    monkeypatch.setattr(webwatch, "verify_playwright_browser", lambda: verified.append(True))
+    installer = runpy.run_path(str(script_path))
+    monkeypatch.setattr(installer["subprocess"], "run", lambda command, **kwargs: install_calls.append((command, kwargs)))
+
+    installer["main"](platform="linux")
+
+    command, options = install_calls[0]
+    assert command == [
+        installer["sys"].executable, "-m", "playwright", "install",
+        "--only-shell", "--with-deps", "chromium",
+    ]
+    assert options["env"]["PLAYWRIGHT_BROWSERS_PATH"] == str(webwatch.PLAYWRIGHT_BROWSERS_DIR)
+    assert verified == [True]

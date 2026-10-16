@@ -225,6 +225,93 @@ def test_due_run_uses_real_check_path_saves_each_site_and_skips_demo(scheduler_c
     assert settings["run_summary"]["failed"] == 1
 
 
+def test_scheduler_fetches_shared_url_once_for_two_hundred_owners(scheduler_client, monkeypatch):
+    client, database = scheduler_client
+    add_site(client, "https://1.1.1.1/")
+    client.put("/api/schedule", json={"enabled": True, "interval_minutes": 60})
+    with sqlite3.connect(database) as db:
+        for index in range(2, 201):
+            email = f"watcher{index}@example.test"
+            db.execute(
+                "INSERT INTO users (email, email_normalized, password_hash, role, created_at) "
+                "VALUES (?, ?, 'unused-test-hash', 'member', ?)",
+                (email, email, webwatch.utc_now()),
+            )
+            owner_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            db.execute(
+                "INSERT INTO user_settings (owner_id, setting_key, setting_value) VALUES (?, 'schedule_enabled', '1')",
+                (owner_id,),
+            )
+            url = "https://1.1.1.1:443#ignored-fragment" if index % 2 else "https://1.1.1.1/"
+            db.execute(
+                "INSERT INTO websites (url, created_at, display_name, owner_id) VALUES (?, ?, ?, ?)",
+                (url, webwatch.utc_now(), f"Watcher {index}", owner_id),
+            )
+    requests = []
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"Content-Type": "text/html", "Content-Length": "39"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def iter_content(chunk_size):
+            assert chunk_size == 16384
+            yield b"<html><body>Shared page</body></html>"
+
+    class FakeSession:
+        trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def mount(_prefix, _adapter):
+            return None
+
+        def get(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return FakeResponse()
+
+    def fake_render(url, **kwargs):
+        body, _headers, _final_url = webwatch.fetch_public_resource(
+            url, accept="text/html,application/xhtml+xml",
+            max_bytes=webwatch.MAX_RESPONSE_BYTES, require_html=True,
+        )
+        return webwatch.extract_readable_text(body)
+
+    monkeypatch.setattr(webwatch, "reserve_domain_slot", lambda _url: None)
+    monkeypatch.setattr(webwatch.requests, "Session", FakeSession)
+    monkeypatch.setattr(webwatch, "render_page_text", fake_render)
+
+    result = webwatch.run_due_schedule()
+
+    assert result["total"] == result["completed"] == result["successful"] == 200
+    assert result["failed"] == 0
+    # Count actual requests.Session.get calls at WebWatch's SSRF-validated
+    # HTTP fetch boundary; the transport itself is controlled and offline.
+    assert [url for url, _kwargs in requests] == ["https://1.1.1.1/"]
+    assert requests[0][1]["allow_redirects"] is False
+    assert requests[0][1]["stream"] is True
+    with sqlite3.connect(database) as db:
+        assert db.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 200
+        assert db.execute(
+            "SELECT COUNT(DISTINCT w.owner_id) FROM snapshots s JOIN websites w ON w.id=s.website_id"
+        ).fetchone()[0] == 200
+
+
 def test_due_run_records_read_timeout_as_site_error(scheduler_client, monkeypatch):
     client, database = scheduler_client
     website_id = add_site(client, "https://1.1.1.1/")
