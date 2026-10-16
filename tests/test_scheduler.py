@@ -27,6 +27,37 @@ def add_site(client, url, interval=60):
     return response.get_json()["id"]
 
 
+def test_pending_retry_runs_inside_flask_context_and_completes(scheduler_client, monkeypatch, caplog):
+    _client, database = scheduler_client
+    website_id = add_site(_client, "https://1.1.1.1/")
+    with sqlite3.connect(database) as db:
+        db.row_factory = sqlite3.Row
+        job_id, _created = webwatch.enqueue_check_job(db, website_id, "manual")
+        webwatch.update_check_job(
+            db, job_id, "retry", attempts=1, error="temporary timeout",
+            next_run_at="2000-01-01T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(webwatch, "reserve_domain_slot", lambda _url: None)
+    monkeypatch.setattr(webwatch, "render_page_text", lambda _url: "Recovered page")
+    result = webwatch.run_due_schedule()
+
+    assert result is None  # The disabled automatic schedule only drains durable jobs.
+    with sqlite3.connect(database) as db:
+        db.row_factory = sqlite3.Row
+        job = db.execute("SELECT status, attempts FROM check_jobs WHERE id = ?", (job_id,)).fetchone()
+        website = db.execute(
+            "SELECT last_check_status FROM websites WHERE id = ?", (website_id,)
+        ).fetchone()
+        snapshot = db.execute(
+            "SELECT content_text FROM snapshots WHERE website_id = ?", (website_id,)
+        ).fetchone()
+    assert (job["status"], job["attempts"]) == ("succeeded", 2)
+    assert website["last_check_status"] == "baseline"
+    assert snapshot["content_text"] == "Recovered page"
+    assert "Working outside of application context" not in caplog.text
+
+
 def test_schedule_defaults_and_enable_disable_are_persisted(scheduler_client):
     client, database = scheduler_client
 

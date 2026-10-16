@@ -1,5 +1,8 @@
 """Playwright rendering tests with all network responses supplied locally."""
 
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 
 import app as webwatch
@@ -22,6 +25,41 @@ def test_render_timeout_diagnostic_exposes_only_bounded_public_request_metadata(
     assert "story" not in str(diagnostic)
     assert "secret" not in str(diagnostic)
     assert "fragment" not in str(diagnostic)
+
+
+def test_chromium_launch_failure_logs_type_and_redacted_message(monkeypatch, caplog):
+    class Chromium:
+        @staticmethod
+        def launch(**_kwargs):
+            raise RuntimeError(
+                "launch failed at https://user:password@auth.example/private/page?token=topsecret "
+                "Authorization: Bearer api-secret"
+            )
+
+    class SyncManager:
+        def __enter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        def __exit__(self, *_args):
+            return False
+
+    playwright_package = ModuleType("playwright")
+    playwright_package.__path__ = []
+    sync_api = ModuleType("playwright.sync_api")
+    sync_api.sync_playwright = SyncManager
+    sync_api.TimeoutError = type("PlaywrightTimeoutError", (Exception,), {})
+    monkeypatch.setitem(sys.modules, "playwright", playwright_package)
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+
+    with caplog.at_level("WARNING", logger="webwatch.render"):
+        with pytest.raises(webwatch.WebsiteTemporaryError, match="Check the browser installation"):
+            webwatch.render_page_text("https://example.com/")
+
+    assert "phase=chromium_launch" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert "launch failed at https://auth.example/[redacted]" in caplog.text
+    for sensitive in ("user", "password", "/private/page", "topsecret", "api-secret"):
+        assert sensitive not in caplog.text
 
 
 def test_rendered_javascript_text_and_private_subresource_blocking(monkeypatch):

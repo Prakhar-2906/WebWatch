@@ -145,8 +145,9 @@ themeToggle.addEventListener('click', () => {
 });
 
 async function api(path, options = {}) {
-  const method = (options.method || 'GET').toUpperCase();
-  const headers = { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers };
+  const { timeoutMs = 15000, ...fetchOptions } = options;
+  const method = (fetchOptions.method || 'GET').toUpperCase();
+  const headers = { ...(fetchOptions.body ? { 'Content-Type': 'application/json' } : {}), ...fetchOptions.headers };
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
     headers['X-WebWatch-Request'] = '1';
     const tokenResponse = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
@@ -156,12 +157,12 @@ async function api(path, options = {}) {
     headers['X-CSRF-Token'] = csrf;
   }
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   let response;
   let result;
   try {
     response = await fetch(path, {
-      ...options,
+      ...fetchOptions,
       cache: 'no-store',
       headers,
       signal: controller.signal,
@@ -174,7 +175,7 @@ async function api(path, options = {}) {
     }
   } catch (error) {
     if (error.name === 'AbortError') {
-      throw new Error('WebWatch did not respond within 15 seconds. Check the Flask server and try again.');
+      throw new Error(`WebWatch did not respond within ${Math.ceil(timeoutMs / 1000)} seconds. The check may still be running; refresh the page to see its status.`);
     }
     throw new Error('Could not reach WebWatch. Check that the Flask server is running and try again.');
   } finally {
@@ -756,6 +757,8 @@ document.querySelector('#notification-toast-close').addEventListener('click', ()
 updateBrowserNotificationControl();
 
 function statusLabel(site) {
+  if (['queued', 'running'].includes(site.active_check_job?.status)) return 'Check in progress';
+  if (site.active_check_job?.status === 'retry') return 'Retry pending';
   if (site.last_check_status === 'baseline') return 'Baseline saved';
   if (site.last_check_status === 'changed') return 'Content changed';
   if (site.last_check_status === 'unchanged') return 'No change';
@@ -1418,7 +1421,13 @@ function renderWebsiteRows(target, sites) {
     timeIcon.setAttribute('aria-hidden', 'true');
     timeIcon.textContent = '◷';
     const timeText = document.createElement('span');
-    timeText.textContent = `${['error', 'blocked', 'captcha', 'rate_limited'].includes(site.last_check_status) ? 'Last attempt' : 'Last checked'}: ${displayTime(site.last_checked_at)}`;
+    if (['queued', 'running'].includes(site.active_check_job?.status)) {
+      timeText.textContent = `${site.active_check_job.status === 'queued' ? 'Check queued' : 'Check started'}: ${displayTime(site.active_check_job.updated_at)}`;
+    } else if (site.active_check_job?.status === 'retry') {
+      timeText.textContent = `Retry pending: ${displayTime(site.active_check_job.next_run_at || site.active_check_job.updated_at)}`;
+    } else {
+      timeText.textContent = `${['error', 'blocked', 'captcha', 'rate_limited'].includes(site.last_check_status) ? 'Last attempt' : 'Last checked'}: ${displayTime(site.last_checked_at)}`;
+    }
     time.append(timeIcon, timeText);
     time.title = site.last_checked_at ? `Last check attempt: ${site.last_checked_at}` : 'This page has not been checked';
 
@@ -1437,11 +1446,12 @@ function renderWebsiteRows(target, sites) {
     const check = document.createElement('button');
     check.className = 'check-button';
     check.type = 'button';
-    const rowBusy = pendingChecks.has(site.id) || checkAllWebsiteIds.has(site.id) || pendingRemovals.has(site.id) || pendingDemoVersions.has(site.id) || pendingVisibilityChanges.has(site.id);
+    const serverCheckActive = ['queued', 'running'].includes(site.active_check_job?.status);
+    const rowBusy = pendingChecks.has(site.id) || serverCheckActive || checkAllWebsiteIds.has(site.id) || pendingRemovals.has(site.id) || pendingDemoVersions.has(site.id) || pendingVisibilityChanges.has(site.id);
     check.disabled = checkAllRunning || rowBusy;
-    check.textContent = pendingChecks.has(site.id)
+    check.textContent = (pendingChecks.has(site.id) || site.active_check_job?.status === 'running')
       ? 'Checking…'
-      : (checkAllWebsiteIds.has(site.id) ? 'Queued for Check All' : 'Check now');
+      : (site.active_check_job?.status === 'queued' || checkAllWebsiteIds.has(site.id) ? 'Queued for check' : 'Check now');
     check.setAttribute('aria-label', `Check ${new URL(site.url).hostname}`);
     check.addEventListener('click', () => checkWebsite(site.id));
     actions.append(historyButton, check);
@@ -1844,7 +1854,7 @@ async function checkAllWebsites() {
       render();
       updateCheckAllProgress(completed, total, site.url);
       try {
-        const result = await api(`/api/websites/${site.id}/check`, { method: 'POST' });
+        const result = await api(`/api/websites/${site.id}/check`, { method: 'POST', timeoutMs: 75000 });
         successful += 1;
         if (result.last_check_status === 'changed') changes += 1;
         if (recordSeriousNotification(result.notification)) {
@@ -1907,21 +1917,21 @@ async function checkWebsite(id) {
   pendingChecks.add(id);
   render();
   try {
-    const updated = await api(`/api/websites/${id}/check`, { method: 'POST' });
+    const updated = await api(`/api/websites/${id}/check`, { method: 'POST', timeoutMs: 75000 });
     recordSeriousNotification(updated.notification);
-    await loadWebsites();
+    await Promise.all([loadWebsites(), refreshJobQueue()]);
     message.dataset.kind = 'success';
     message.textContent = `Check complete: ${statusLabel(updated)}.`;
   } catch (error) {
     // The server stores check errors on the website; reload to show that state.
-    await loadWebsites();
+    await Promise.all([loadWebsites(), refreshJobQueue()]);
     recordSeriousNotification(error.data?.notification);
     message.dataset.kind = 'error';
     message.textContent = error.message;
   } finally {
     pendingChecks.delete(id);
     render();
-    await loadStats();
+    await Promise.all([loadStats(), refreshJobQueue()]);
   }
 }
 
@@ -2083,7 +2093,7 @@ if (guestExitButton) guestExitButton.addEventListener('click', async () => {
   guestExitButton.disabled = true;
   try {
     await api('/auth/logout', { method: 'POST' });
-    window.location.assign('/login');
+    location.assign('/login');
   } catch (error) {
     message.textContent = error.message;
     guestExitButton.disabled = false;
@@ -2101,4 +2111,7 @@ refreshJobQueue();
 window.setInterval(async () => {
   if (!guestMode) await loadSchedule();
   await refreshJobQueue();
+  if (websites.some((site) => ['queued', 'running', 'retry'].includes(site.active_check_job?.status))) {
+    await loadWebsites();
+  }
 }, 10000);

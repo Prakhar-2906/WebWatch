@@ -670,6 +670,24 @@ test('website rows distinguish due, disabled, never-checked, invalid-time, and d
   assert.ok(findAll(rows[2], (node) => /Unknown time/.test(node.textContent)).length > 0);
 });
 
+test('website row shows persisted queued or running checks instead of Not checked yet', async () => {
+  const sites = [
+    { id: 86, url: 'https://queued.example/', is_demo: false, last_check_status: 'not_checked',
+      active_check_job: { status: 'queued', updated_at: '2026-10-16T10:00:00Z' } },
+    { id: 87, url: 'https://running.example/', is_demo: false, last_check_status: 'not_checked',
+      active_check_job: { status: 'running', updated_at: '2026-10-16T10:01:00Z' } },
+  ];
+  const harness = makeHarness({ sites });
+  await harness.start();
+  const rows = findAll(harness.elements.get('#website-list'), (node) => node.className === 'website-row');
+  assert.ok(findBy(rows[0], (node) => node.textContent === 'Check in progress'));
+  assert.equal(findBy(rows[0], (node) => node.className === 'check-button').textContent, 'Queued for check');
+  assert.ok(findBy(rows[1], (node) => node.textContent === 'Check in progress'));
+  const runningButton = findBy(rows[1], (node) => node.className === 'check-button');
+  assert.equal(runningButton.textContent, 'Checking…');
+  assert.equal(runningButton.disabled, true);
+});
+
 test('compact website rows keep primary actions visible and management actions in More', async () => {
   const sites = [{
     id: 41,

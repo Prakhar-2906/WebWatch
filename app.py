@@ -131,6 +131,8 @@ _scheduler_thread_guard = threading.Lock()
 _scheduler_thread = None
 _scheduler_stop = threading.Event()
 _render_cache = contextvars.ContextVar("webwatch_render_cache", default=None)
+_browser_render_slots = threading.BoundedSemaphore(1)
+BROWSER_RENDER_SLOT_WAIT_SECONDS = 40
 render_logger = logging.getLogger("webwatch.render")
 
 
@@ -206,6 +208,49 @@ def sanitized_render_request_diagnostic(url, resource_type, role, phase, elapsed
         "phase": phase if phase in allowed_phases else "failed",
         "elapsed_ms": elapsed,
     }
+
+
+_RENDER_ERROR_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_RENDER_ERROR_SECRET_RE = re.compile(
+    r"(?i)\b(authorization|cookie|set-cookie|token|secret|password|api[_-]?key)\s*[:=]\s*(?:Bearer\s+)?[^\s,;]+"
+)
+
+
+def sanitized_renderer_error_message(error):
+    """Keep useful exception diagnostics while dropping URL paths and secret values."""
+    message = str(error)
+
+    def redact_url(match):
+        raw = match.group(0)
+        candidate = raw.rstrip(".,);]")
+        punctuation = raw[len(candidate):]
+        try:
+            parts = urlsplit(candidate)
+            host = parts.hostname or "redacted-host"
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            port = f":{parts.port}" if parts.port else ""
+            safe_url = f"{parts.scheme}://{host}{port}/[redacted]"
+        except ValueError:
+            safe_url = "[redacted-url]"
+        return safe_url + punctuation
+
+    message = _RENDER_ERROR_URL_RE.sub(redact_url, message)
+    message = _RENDER_ERROR_SECRET_RE.sub(r"\1=[redacted]", message)
+    message = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", message)
+    return message[:800]
+
+
+def log_renderer_exception(phase, start_url, error):
+    """Log renderer failure phase and safe exception details without page data."""
+    try:
+        hostname = urlsplit(start_url).hostname or "unknown"
+    except (TypeError, ValueError):
+        hostname = "unknown"
+    render_logger.warning(
+        "renderer_failure phase=%s host=%s exception_type=%s message=%s",
+        phase, hostname, type(error).__name__, sanitized_renderer_error_message(error),
+    )
 
 
 class PinnedAddressAdapter(HTTPAdapter):
@@ -1076,6 +1121,22 @@ def fetch_public_resource(start_url, accept="*/*", max_bytes=512 * 1024, require
 
 def render_page_text(start_url, selectors=None, preview=False,
                      max_document_size_kib=DEFAULT_DOCUMENT_LIMIT_KIB):
+    """Limit Chromium to one concurrent session to bound memory on small hosts."""
+    if not _browser_render_slots.acquire(timeout=BROWSER_RENDER_SLOT_WAIT_SECONDS):
+        error = WebsiteTemporaryError("The browser renderer is busy. Try this check again shortly.")
+        log_renderer_exception("renderer_slot_wait", start_url, error)
+        raise error
+    try:
+        return _render_page_text_with_browser(
+            start_url, selectors=selectors, preview=preview,
+            max_document_size_kib=max_document_size_kib,
+        )
+    finally:
+        _browser_render_slots.release()
+
+
+def _render_page_text_with_browser(start_url, selectors=None, preview=False,
+                                   max_document_size_kib=DEFAULT_DOCUMENT_LIMIT_KIB):
     """Render JavaScript pages while routing every network resource through SSRF checks."""
     if (isinstance(max_document_size_kib, bool) or not isinstance(max_document_size_kib, int)
             or not DEFAULT_DOCUMENT_LIMIT_KIB <= max_document_size_kib <= MAX_DOCUMENT_LIMIT_KIB):
@@ -1134,10 +1195,16 @@ def render_page_text(start_url, selectors=None, preview=False,
 
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=True,
-                args=["--disable-background-networking", "--disable-component-update", "--disable-sync", "--no-first-run"],
-            )
+            try:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=["--disable-background-networking", "--disable-component-update", "--disable-sync", "--no-first-run"],
+                )
+            except Exception as exc:
+                log_renderer_exception("chromium_launch", start_url, exc)
+                raise WebsiteTemporaryError(
+                    "The webpage could not be rendered. Check the browser installation and try again."
+                ) from exc
             try:
                 context = browser.new_context(service_workers="block", accept_downloads=False)
                 context.route_web_socket("**/*", deny_socket)
@@ -1243,6 +1310,7 @@ def render_page_text(start_url, selectors=None, preview=False,
                 except Exception as exc:
                     if fatal_document_error:
                         raise fatal_document_error[0] from exc
+                    log_renderer_exception("navigation", start_url, exc)
                     raise WebsiteTemporaryError("The webpage could not be rendered. Check the browser installation and try again.") from exc
                 if fatal_document_error:
                     raise fatal_document_error[0]
@@ -1293,6 +1361,7 @@ def render_page_text(start_url, selectors=None, preview=False,
     except (WebsiteUnreachableError, WebsiteTemporaryError, ValueError):
         raise
     except Exception as exc:
+        log_renderer_exception("browser_session", start_url, exc)
         raise WebsiteTemporaryError("The webpage could not be rendered. Check the browser installation and try again.") from exc
 
 
@@ -1381,6 +1450,12 @@ def website_for_ui(db, row):
         (site["id"],),
     ).fetchone()
     site["baseline_at"] = snapshot["checked_at"] if snapshot else None
+    active_check = db.execute(
+        "SELECT id, status, attempts, updated_at, next_run_at, last_error FROM check_jobs "
+        "WHERE website_id = ? AND status IN ('queued','running','retry') ORDER BY id DESC LIMIT 1",
+        (site["id"],),
+    ).fetchone()
+    site["active_check_job"] = dict(active_check) if active_check else None
     schedule_enabled = owner_settings_for_id(db, site.get("owner_id"), exact="schedule_enabled").get("schedule_enabled") == "1"
     site["automatic_checks_enabled"] = schedule_enabled and not bool(site.get("is_demo"))
     site["next_check_at"] = next_website_check_at(site) if site["automatic_checks_enabled"] else None
@@ -2293,7 +2368,10 @@ def run_due_schedule():
                             if attempts is None:
                                 continue
                             reserve_domain_slot(job["url"])
-                            result = check_site(job["website_id"], wait_for_lock=True)
+                            # check_site builds Flask JSON responses, so retries processed
+                            # by the background scheduler need an application context too.
+                            with app.app_context():
+                                result = check_site(job["website_id"], wait_for_lock=True)
                             response = result[0] if isinstance(result, tuple) else result
                             status_code = result[1] if isinstance(result, tuple) and len(result) > 1 else getattr(response, "status_code", 200)
                             payload = response.get_json(silent=True) if hasattr(response, "get_json") else {}
@@ -2822,12 +2900,26 @@ def check_website(website_id):
             with get_db() as db:
                 update_check_job(db, job_id, "failed" if status_code >= 400 else "succeeded",
                                  attempts=attempt, error=(payload or {}).get("error") if status_code >= 400 else None)
-        deliver_pending_alerts()
+        try:
+            deliver_pending_alerts()
+        except Exception:
+            # A notification delivery problem must not hide a completed page check.
+            app.logger.exception("Alert delivery failed after manual check for website id=%s", website_id)
         return result
-    except Exception as exc:
-        with get_db() as db:
-            update_check_job(db, job_id, "failed", attempts=attempt, error=str(exc)[:500])
-        raise
+    except Exception:
+        failure = "The manual check could not be completed. Please try again; the server logged the error."
+        app.logger.exception("Manual check failed before a result was recorded for website id=%s", website_id)
+        try:
+            with get_db() as db:
+                update_check_job(db, job_id, "failed", attempts=attempt, error=failure)
+                db.execute(
+                    "UPDATE websites SET last_checked_at = ?, last_check_status = 'error', "
+                    "last_check_category = 'check_error', last_error = ?, last_changed = NULL WHERE id = ?",
+                    (utc_now(), failure, website_id),
+                )
+        except Exception:
+            app.logger.exception("Could not persist manual-check failure for website id=%s", website_id)
+        return jsonify(error=failure, category="check_error"), 500
 
 
 def check_site(website_id, wait_for_lock=False):

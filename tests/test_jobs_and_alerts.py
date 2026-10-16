@@ -3,6 +3,7 @@
 import json
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -26,6 +27,47 @@ def add_site(client, url):
     response = client.post("/api/websites", json={"url": url})
     assert response.status_code == 201
     return response.get_json()["id"]
+
+
+def test_chromium_render_sessions_are_serialized(jobs_client, monkeypatch):
+    _client, _database = jobs_client
+    entered = threading.Event()
+    release_first = threading.Event()
+    guard = threading.Lock()
+    active = 0
+    max_active = 0
+    calls = 0
+
+    def fake_browser_render(*_args, **_kwargs):
+        nonlocal active, max_active, calls
+        with guard:
+            active += 1
+            calls += 1
+            max_active = max(max_active, active)
+            current_call = calls
+        if current_call == 1:
+            entered.set()
+            assert release_first.wait(3)
+        with guard:
+            active -= 1
+        return "Rendered page"
+
+    monkeypatch.setattr(webwatch, "_render_page_text_with_browser", fake_browser_render)
+    results = []
+    first = threading.Thread(target=lambda: results.append(webwatch.render_page_text("https://one.example/")))
+    second = threading.Thread(target=lambda: results.append(webwatch.render_page_text("https://two.example/")))
+    first.start()
+    assert entered.wait(3)
+    second.start()
+    time.sleep(0.05)
+    assert calls == 1
+    release_first.set()
+    first.join(3)
+    second.join(3)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert results == ["Rendered page", "Rendered page"]
+    assert max_active == 1
 
 
 def test_active_job_is_unique_and_running_jobs_recover_after_restart(jobs_client):
@@ -113,11 +155,42 @@ def test_manual_duplicate_check_returns_conflict_while_first_job_runs(jobs_clien
             response = second_client.post(f"/api/websites/{site_id}/check", headers={"X-WebWatch-Request": "1"})
         assert response.status_code == 409
         assert response.get_json()["job_id"]
+        site_response = second_client.get("/api/websites")
+        site = next(item for item in site_response.get_json() if item["id"] == site_id)
+        assert site["active_check_job"]["status"] == "running"
     finally:
         finish.set()
         worker.join(5)
     assert not worker.is_alive()
     assert first_result["response"].status_code == 200
+
+
+def test_unexpected_manual_check_failure_is_saved_as_a_visible_result(jobs_client, monkeypatch):
+    client, database = jobs_client
+    site_id = add_site(client, "https://1.1.1.1/")
+
+    def fail_before_check(_url):
+        raise RuntimeError("private internal exception detail")
+
+    monkeypatch.setattr(webwatch, "reserve_domain_slot", fail_before_check)
+    response = client.post(f"/api/websites/{site_id}/check")
+
+    assert response.status_code == 500
+    assert response.get_json()["category"] == "check_error"
+    assert "private internal exception detail" not in response.get_json()["error"]
+    with sqlite3.connect(database) as db:
+        db.row_factory = sqlite3.Row
+        site = db.execute(
+            "SELECT last_checked_at, last_check_status, last_check_category, last_error "
+            "FROM websites WHERE id = ?", (site_id,)
+        ).fetchone()
+        job = db.execute(
+            "SELECT status, last_error FROM check_jobs WHERE website_id = ?", (site_id,)
+        ).fetchone()
+    assert site["last_checked_at"]
+    assert (site["last_check_status"], site["last_check_category"]) == ("error", "check_error")
+    assert job["status"] == "failed"
+    assert "could not be completed" in site["last_error"]
 
 
 def test_same_normalized_render_settings_fetch_once_and_distribute_history(jobs_client, monkeypatch):
