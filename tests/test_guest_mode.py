@@ -75,6 +75,21 @@ def test_guest_can_enter_and_use_isolated_monitoring_features(tmp_path, monkeypa
         assert len(token_hash) == 64
 
 
+def test_guest_dashboard_explains_account_only_schedule_and_webhook_options(tmp_path, monkeypatch):
+    _isolated_database(tmp_path, monkeypatch)
+    guest = webwatch.app.test_client()
+    _guest(guest)
+
+    page = guest.get("/")
+
+    assert page.status_code == 200
+    assert b"Automatic checks and alert settings are only available to signed-in accounts." in page.data
+    assert b'href="#schedule-heading"' not in page.data
+    assert b'href="#alerts-heading"' not in page.data
+    assert b'aria-labelledby="schedule-heading" hidden' in page.data
+    assert b'aria-labelledby="alerts-heading" hidden' in page.data
+
+
 def test_guest_creation_and_mutations_keep_csrf_and_guest_cookie_unforgeable(tmp_path, monkeypatch):
     _isolated_database(tmp_path, monkeypatch)
     anonymous = webwatch.app.test_client()

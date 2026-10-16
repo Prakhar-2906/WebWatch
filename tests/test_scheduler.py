@@ -538,7 +538,13 @@ def test_dashboard_has_accessible_schedule_controls(scheduler_client):
     assert b'id="schedule-form"' in page.data
     assert b'id="schedule-enabled"' in page.data
     assert b'id="schedule-interval"' in page.data
+    assert b'href="#schedule-heading"' in page.data
+    assert b'id="alert-settings-form"' in page.data
+    assert b'id="alert-webhook-enabled"' in page.data
+    assert b'id="alert-webhook-url"' in page.data
+    assert b'href="#alerts-heading"' in page.data
     assert b"api('/api/schedule')" in client.get("/static/app.js").data
+    assert b"api('/api/alerts'" in client.get("/static/app.js").data
     assert b"method: 'PUT'" in client.get("/static/app.js").data
     assert b'id="website-interval-presets"' in page.data
 
