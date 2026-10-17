@@ -28,7 +28,7 @@ def test_render_timeout_diagnostic_exposes_only_bounded_public_request_metadata(
         "resource_type": "script",
         "role": "main_document",
         "phase": "started",
-        "elapsed_ms": 35_000,
+        "elapsed_ms": webwatch.RENDER_DEADLINE_SECONDS * 1000,
     }
     assert "password" not in str(diagnostic)
     assert "story" not in str(diagnostic)
@@ -201,6 +201,76 @@ def test_per_site_document_limit_does_not_raise_subresource_limit(monkeypatch):
     assert limits["https://example.com/asset.js"] == (512 * 1024, False)
 
 
+def test_large_main_document_renders_with_higher_per_site_limit(monkeypatch):
+    limits = {}
+    large_html = (
+        b"<html><body><main>Large publisher document works</main>"
+        + b" " * (700 * 1024)
+        + b"</body></html>"
+    )
+
+    def safe_resource(url, max_bytes, require_html=False, **_kwargs):
+        limits[url] = (max_bytes, require_html)
+        return large_html, {"Content-Type": "text/html"}, url
+
+    patch_resource_fetch(monkeypatch, safe_resource)
+    result = webwatch.render_page_text("https://example.com/", max_document_size_kib=2048)
+
+    assert "Large publisher document works" in result
+    assert limits["https://example.com/"] == (2048 * 1024, True)
+
+
+def test_main_document_over_configured_limit_fails_without_a_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        webwatch, "fetch_public_resource_async",
+        lambda _url, **_kwargs: (_ for _ in ()).throw(
+            ValueError("The webpage resource is too large to check.")
+        ),
+    )
+
+    with pytest.raises(webwatch.WebsiteResourceLimitError, match="2048 KiB per-resource limit"):
+        webwatch.render_page_text("https://example.com/", max_document_size_kib=2048)
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(None, 60), ("90", 90), ("1", 35), ("999", 120), ("invalid", 60), ("", 60)],
+)
+def test_render_timeout_configuration_is_validated_and_bounded(configured, expected):
+    environment = {} if configured is None else {"WEBWATCH_RENDER_TIMEOUT_SECONDS": configured}
+    assert webwatch.configured_render_deadline_seconds(environment) == expected
+
+
+def test_configured_120_second_deadline_reaches_renderer_and_error_message(monkeypatch):
+    monkeypatch.setenv("WEBWATCH_RENDER_TIMEOUT_SECONDS", "120")
+    deadline_seconds = webwatch.configured_render_deadline_seconds()
+    monkeypatch.setattr(webwatch, "RENDER_DEADLINE_SECONDS", deadline_seconds)
+    observed = {}
+
+    class RenderSlot:
+        def acquire(self, timeout):
+            observed["slot_timeout"] = timeout
+            return True
+
+        @staticmethod
+        def release():
+            pass
+
+    def render_with_browser(*_args, deadline, **_kwargs):
+        observed["renderer_deadline"] = deadline
+        raise webwatch.render_deadline_error()
+
+    monkeypatch.setattr(webwatch, "_browser_render_slots", RenderSlot())
+    monkeypatch.setattr(webwatch, "_render_page_text_with_browser", render_with_browser)
+    start = webwatch.time.monotonic()
+
+    with pytest.raises(webwatch.WebsiteTimeoutError, match="120-second render limit"):
+        webwatch.render_page_text("https://example.com/")
+
+    assert observed["slot_timeout"] == webwatch.BROWSER_RENDER_SLOT_WAIT_SECONDS
+    assert observed["renderer_deadline"] == pytest.approx(start + 120, abs=0.1)
+
+
 def test_document_size_failure_names_the_configured_limit(monkeypatch):
     monkeypatch.setattr(
         webwatch, "fetch_public_resource_async",
@@ -333,7 +403,7 @@ def test_render_timeout_cancels_pending_route_and_releases_renderer_slot(monkeyp
             cancelled.set()
 
     monkeypatch.setattr(webwatch, "fetch_public_resource_async", slow_resource)
-    with pytest.raises(webwatch.WebsiteTimeoutError):
+    with pytest.raises(webwatch.WebsiteTimeoutError, match="5-second render limit"):
         webwatch.render_page_text("https://example.com/")
     assert cancelled.is_set()
 

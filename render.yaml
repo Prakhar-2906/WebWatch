@@ -15,3 +15,9 @@ services:
         value: /tmp/webwatch.sqlite3
       - key: WEBWATCH_TRUST_PROXY
         value: "true"
+      - key: WEBWATCH_DEMO_ACCOUNT
+        sync: false
+      - key: WEBWATCH_DEMO_EMAIL
+        sync: false
+      - key: WEBWATCH_DEMO_PASSWORD
+        sync: false

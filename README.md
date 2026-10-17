@@ -34,12 +34,15 @@ Open <http://127.0.0.1:5000>, select **Set up owner**, and enter the setup token
 | `WEBWATCH_DATABASE` | Optional SQLite database path. Defaults to `instance/webwatch.sqlite3`. |
 | `WEBWATCH_OWNER_SETUP_TOKEN` | One-time first-owner setup token. Remove it after setup. |
 | `WEBWATCH_TRUST_PROXY` | Optional `true`/`false` override for trusting one hosting proxy. By default this is enabled when `PORT` is set. |
+| `WEBWATCH_RENDER_TIMEOUT_SECONDS` | Optional bounded end-to-end JavaScript render deadline; defaults to 60 seconds and is clamped to 35–120 seconds. |
 | `WEBWATCH_GUEST_TTL_SECONDS` | Guest session lifetime, 900–86400 seconds; default is 21600 (6 hours). |
-| `WEBWATCH_DEMO_ACCOUNT` | Set to `true` to provision the optional demo account at startup. `WEBWATCH_DEMO_EMAIL` and `WEBWATCH_DEMO_PASSWORD` supply its credentials. |
+| `WEBWATCH_DEMO_ACCOUNT` | Set to `true` to provision the optional demo account at startup. Set `WEBWATCH_DEMO_EMAIL` and `WEBWATCH_DEMO_PASSWORD` in the service environment; they are not stored in source control. |
 | `WEBWATCH_SMTP_HOST`, `WEBWATCH_SMTP_PORT`, `WEBWATCH_SMTP_FROM`, `WEBWATCH_SMTP_USER`, `WEBWATCH_SMTP_PASSWORD` | Optional SMTP delivery settings. Port defaults to 587; STARTTLS is used. |
 | `WEBWATCH_SUMMARY_API_KEY` | Optional key for AI summaries. `WEBWATCH_SUMMARY_API_URL` and `WEBWATCH_SUMMARY_MODEL` can select an OpenAI-compatible endpoint and model. |
 
-Never place secrets in source control or browser code. The demo credentials are public and should be used only for non-sensitive test data. On Voroa, `/tmp/webwatch.sqlite3` may be ephemeral; the database and demo account can disappear after a restart or redeploy.
+Never place secrets or demo passwords in source control or browser code. Demo credentials are service-specific and should be used only with non-sensitive test data. Demo setup inserts a member only when that normalized email is absent; startup never changes the password or role of an existing account. Changing the environment password does not change an existing account, and the app does not currently provide password recovery.
+
+For deployments, set `WEBWATCH_DEMO_ACCOUNT=true`, `WEBWATCH_DEMO_EMAIL`, and `WEBWATCH_DEMO_PASSWORD` in the service's private environment settings. The login page does not publish credentials. On Render, the current free blueprint uses `/tmp/webwatch.sqlite3`, which is ephemeral; free web services cannot attach persistent disks. To retain SQLite data across restarts and deploys, use a paid Render web service, attach a persistent disk mounted at `/var/data`, and set `WEBWATCH_DATABASE=/var/data/webwatch.sqlite3`. Existing database files must be copied to that disk before pointing the service at it; do not switch paths if doing so would abandon data that must be retained.
 
 ## Voroa deployment
 
@@ -55,6 +58,8 @@ Deploy WebWatch as a Docker runtime service so Playwright's browser and OS libra
 Voroa says a service's runtime cannot be changed after it is created. The existing Python-runtime service therefore needs a new Docker-runtime service. Keep the old service until the new one is verified and its environment is copied. The current `/tmp/webwatch.sqlite3` database is ephemeral and is not transferred to a new service; preserve or migrate any data separately before retiring the old service. Do not reuse a database file from the Docker build context.
 
 `Dockerfile` sets `PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers`; the app and installer resolve that same absolute location. The Docker build runs the installer in the final image, where `--with-deps` installs shared libraries and the pinned Playwright package selects and verifies the matching headless-shell revision. The Gunicorn readiness hook starts the scheduler without initializing Playwright; rendering starts the browser only when a check needs it. `render.yaml` remains a separate Render blueprint and is not used by Voroa's Docker runtime.
+
+JavaScript rendering uses a per-site main-document limit that defaults to 2048 KiB and can be set from 512 to 4096 KiB. The database migration raises legacy 512 KiB defaults to 2048 KiB and retains custom legacy limits. Each subresource remains capped at 512 KiB, and the full render remains bounded to 8 MiB and 100 requests. `WEBWATCH_RENDER_TIMEOUT_SECONDS` controls the complete render deadline (60 seconds by default, bounded to 35–120); it does not make network requests unlimited.
 
 Run one Gunicorn worker. The scheduler and shared-fetch cycle cache are process-local, and SQLite is configured for one application process. The shared-fetch cache reuses a successful compatible result across users due in the same scheduler cycle and coalesces overlapping compatible requests. Each user's snapshots, status, history, and alert handling remain separate. This is not cross-process coordination; horizontal scaling or multiple workers needs a separate shared scheduler/cache design.
 

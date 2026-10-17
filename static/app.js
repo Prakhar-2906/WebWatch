@@ -1,5 +1,7 @@
 // Theme preference stays in this browser; website records live in the Flask database.
 const THEME_KEY = 'webwatch.theme.v1';
+// The server allows at most 120 seconds for rendering; leave room for response handling.
+const CHECK_REQUEST_TIMEOUT_MS = 135000;
 const form = document.querySelector('#add-form');
 const urlInput = document.querySelector('#website-url');
 const nameInput = document.querySelector('#website-name');
@@ -1548,15 +1550,15 @@ function renderWebsiteRows(target, sites) {
       const documentLimitInput = document.createElement('input');
       documentLimitInput.type = 'number';
       documentLimitInput.min = '512';
-      documentLimitInput.max = '1024';
+      documentLimitInput.max = '4096';
       documentLimitInput.step = '64';
       documentLimitInput.required = true;
-      documentLimitInput.value = String(site.max_document_size_kib || 512);
+      documentLimitInput.value = String(site.max_document_size_kib || 2048);
       documentLimitInput.setAttribute('aria-label', 'Main document limit in KiB');
       documentLimitLabel.append(documentLimitInput);
       const documentLimitNote = document.createElement('p');
       documentLimitNote.className = 'retention-note';
-      documentLimitNote.textContent = 'Applies only to this page’s main HTML document (512–1024 KiB). Subresources stay capped at 512 KiB; the whole render stays within 8 MiB and 100 requests.';
+      documentLimitNote.textContent = 'Applies only to this page’s main HTML document (512–4096 KiB). Subresources stay capped at 512 KiB; the whole render stays within 8 MiB and 100 requests.';
       const sensitivityLabel = document.createElement('label');
       sensitivityLabel.textContent = 'Change sensitivity';
       const sensitivitySelect = document.createElement('select');
@@ -1724,12 +1726,18 @@ function renderWebsiteRows(target, sites) {
   }
 }
 
-async function loadWebsites() {
+function websiteMenuIsOpen() {
+  return Array.from(list.querySelectorAll('.site-more-menu')).some((menu) => menu.open);
+}
+
+async function loadWebsites({ background = false } = {}) {
   const requestedHiddenView = hiddenView;
   const requestRevision = watchlistRevision;
   const requestId = ++watchlistRequestId;
-  loadState = 'loading';
-  render();
+  if (!background) {
+    loadState = 'loading';
+    render();
+  }
   try {
     const params = new URLSearchParams();
     params.set('hidden', String(requestedHiddenView));
@@ -1738,7 +1746,8 @@ async function loadWebsites() {
     const queryString = params.toString();
     const suffix = queryString ? `?${queryString}` : '';
     const loadedWebsites = await api(`/api/websites${suffix}`);
-    if (requestRevision !== watchlistRevision || requestId !== watchlistRequestId || requestedHiddenView !== hiddenView) return;
+    if (requestRevision !== watchlistRevision || requestId !== watchlistRequestId
+        || requestedHiddenView !== hiddenView || (background && websiteMenuIsOpen())) return;
     websites = loadedWebsites;
     totalWebsiteCount = loadedWebsites.totalCount ?? loadedWebsites.length;
     loadState = 'ready';
@@ -1747,7 +1756,8 @@ async function loadWebsites() {
     message.textContent = '';
     await loadStats();
   } catch (error) {
-    if (requestRevision !== watchlistRevision || requestId !== watchlistRequestId || requestedHiddenView !== hiddenView) return;
+    if (requestRevision !== watchlistRevision || requestId !== watchlistRequestId
+        || requestedHiddenView !== hiddenView || (background && websiteMenuIsOpen())) return;
     loadState = 'error';
     render();
     message.textContent = `Could not load the watchlist: ${error.message}`;
@@ -1864,7 +1874,7 @@ async function checkAllWebsites() {
       render();
       updateCheckAllProgress(completed, total, site.url);
       try {
-        const result = await api(`/api/websites/${site.id}/check`, { method: 'POST', timeoutMs: 75000 });
+        const result = await api(`/api/websites/${site.id}/check`, { method: 'POST', timeoutMs: CHECK_REQUEST_TIMEOUT_MS });
         successful += 1;
         if (result.last_check_status === 'changed') changes += 1;
         if (recordSeriousNotification(result.notification)) {
@@ -1927,7 +1937,7 @@ async function checkWebsite(id) {
   pendingChecks.add(id);
   render();
   try {
-    const updated = await api(`/api/websites/${id}/check`, { method: 'POST', timeoutMs: 75000 });
+    const updated = await api(`/api/websites/${id}/check`, { method: 'POST', timeoutMs: CHECK_REQUEST_TIMEOUT_MS });
     recordSeriousNotification(updated.notification);
     await Promise.all([loadWebsites(), refreshJobQueue()]);
     message.dataset.kind = 'success';
@@ -2121,7 +2131,8 @@ refreshJobQueue();
 window.setInterval(async () => {
   if (!guestMode) await loadSchedule();
   await refreshJobQueue();
-  if (websites.some((site) => ['queued', 'running', 'retry'].includes(site.active_check_job?.status))) {
-    await loadWebsites();
+  if (!websiteMenuIsOpen()
+      && websites.some((site) => ['queued', 'running', 'retry'].includes(site.active_check_job?.status))) {
+    await loadWebsites({ background: true });
   }
 }, 10000);

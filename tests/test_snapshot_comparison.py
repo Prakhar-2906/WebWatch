@@ -94,21 +94,21 @@ def test_add_and_edit_website_name_and_interval(client, monkeypatch):
 
 def test_main_document_limit_is_per_site_bounded_and_persisted(client):
     site = client.post("/api/websites", json={"url": "https://1.1.1.1/"}).get_json()
-    assert site["max_document_size_kib"] == 512
+    assert site["max_document_size_kib"] == 2048
 
     updated = client.patch(f"/api/websites/{site['id']}/settings", json={
         "display_name": site["display_name"], "check_interval_minutes": 60,
-        "max_document_size_kib": 768,
+        "max_document_size_kib": 4096,
     })
     assert updated.status_code == 200
-    assert updated.get_json()["max_document_size_kib"] == 768
+    assert updated.get_json()["max_document_size_kib"] == 4096
 
     invalid = client.patch(f"/api/websites/{site['id']}/settings", json={
         "display_name": site["display_name"], "check_interval_minutes": 60,
-        "max_document_size_kib": 1025,
+        "max_document_size_kib": 4097,
     })
     assert invalid.status_code == 400
-    assert client.get("/api/websites").get_json()[0]["max_document_size_kib"] == 768
+    assert client.get("/api/websites").get_json()[0]["max_document_size_kib"] == 4096
 
 
 def test_history_retention_defaults_and_settings_validation(client):
@@ -256,16 +256,37 @@ def test_additive_migration_keeps_old_site_and_snapshot_data(tmp_path, monkeypat
             "changed_history_limit, serious_event_limit FROM websites"
         ).fetchone()
         document_limit = db.execute(
-            "SELECT max_document_size_kib FROM websites WHERE id = 41"
-        ).fetchone()[0]
+            "SELECT max_document_size_kib, max_document_size_bytes FROM websites WHERE id = 41"
+        ).fetchone()
         snapshot = db.execute("SELECT id, website_id, content_text, record_type FROM snapshots").fetchone()
         record_types = db.execute("SELECT id, record_type FROM snapshots ORDER BY id").fetchall()
         tables = {entry[0] for entry in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert row == (41, "example.com", 60, 200, 400, 600)
-    assert document_limit == 512
+    assert tuple(document_limit) == (512, 2 * 1024 * 1024)
     assert snapshot == (51, 41, "kept baseline", "baseline")
     assert record_types == [(51, "baseline"), (52, "unchanged"), (53, "changed")]
     assert "private_settings" in tables
+
+
+def test_migration_preserves_custom_legacy_document_limit(tmp_path, monkeypatch):
+    database = tmp_path / "custom-legacy-limit.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.executescript("""
+            CREATE TABLE websites (id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL, max_document_size_kib INTEGER NOT NULL DEFAULT 512
+                CHECK (max_document_size_kib BETWEEN 512 AND 1024));
+            CREATE TABLE snapshots (id INTEGER PRIMARY KEY, website_id INTEGER NOT NULL,
+              content_text TEXT NOT NULL, checked_at TEXT NOT NULL);
+            INSERT INTO websites (id, url, created_at, max_document_size_kib)
+              VALUES (7, 'https://example.com/', '2026-01-01T00:00:00+00:00', 768);
+        """)
+    monkeypatch.setitem(webwatch.app.config, "DATABASE", str(database))
+    webwatch.init_db()
+
+    with sqlite3.connect(database) as db:
+        assert db.execute(
+            "SELECT max_document_size_kib, max_document_size_bytes FROM websites WHERE id = 7"
+        ).fetchone() == (768, 768 * 1024)
 
 
 def test_watchlist_search_and_status_filters_return_matching_sites(client, monkeypatch):

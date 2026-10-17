@@ -207,8 +207,9 @@ JOB_RETRY_BASE_SECONDS = 5
 DOMAIN_MIN_INTERVAL_SECONDS = 2
 MAX_SCREENSHOT_BYTES = 512 * 1024
 CHANGE_ALERT_COOLDOWN_MINUTES = 60
-DEFAULT_DOCUMENT_LIMIT_KIB = 512
-MAX_DOCUMENT_LIMIT_KIB = 1024
+DEFAULT_DOCUMENT_LIMIT_KIB = 2048
+MIN_DOCUMENT_LIMIT_KIB = 512
+MAX_DOCUMENT_LIMIT_KIB = 4096
 MAX_RENDER_REQUESTS = 100
 MAX_REGION_SELECTORS = 20
 MAX_SELECTOR_LENGTH = 250
@@ -234,9 +235,33 @@ _shared_render_flights_guard = threading.Lock()
 _shared_render_flights = {}
 _browser_render_slots = threading.BoundedSemaphore(1)
 BROWSER_RENDER_SLOT_WAIT_SECONDS = 40
-RENDER_DEADLINE_SECONDS = 35
+DEFAULT_RENDER_DEADLINE_SECONDS = 60
+MIN_RENDER_DEADLINE_SECONDS = 35
+MAX_RENDER_DEADLINE_SECONDS = 120
+
+
+def configured_render_deadline_seconds(environ=None):
+    """Return a bounded render deadline, with a safe default for bad config."""
+    environment = os.environ if environ is None else environ
+    raw_value = environment.get("WEBWATCH_RENDER_TIMEOUT_SECONDS")
+    if raw_value is None or not str(raw_value).strip():
+        return DEFAULT_RENDER_DEADLINE_SECONDS
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_RENDER_DEADLINE_SECONDS
+    return min(MAX_RENDER_DEADLINE_SECONDS, max(MIN_RENDER_DEADLINE_SECONDS, value))
+
+
+RENDER_DEADLINE_SECONDS = configured_render_deadline_seconds()
 RENDER_CLEANUP_RESERVE_SECONDS = 2
 render_logger = logging.getLogger("webwatch.render")
+
+
+def render_deadline_error():
+    return WebsiteTimeoutError(
+        f"The webpage exceeded the {RENDER_DEADLINE_SECONDS}-second render limit."
+    )
 
 
 class WebsiteUnreachableError(ValueError):
@@ -301,7 +326,7 @@ def sanitized_render_request_diagnostic(url, resource_type, role, phase, elapsed
     allowed_roles = {"main_document", "child_document", "subresource"}
     allowed_phases = {"started", "finished", "failed"}
     try:
-        elapsed = min(35_000, max(0, int(elapsed_ms)))
+        elapsed = min(RENDER_DEADLINE_SECONDS * 1000, max(0, int(elapsed_ms)))
     except (TypeError, ValueError, OverflowError):
         elapsed = 0
     return {
@@ -488,6 +513,8 @@ def init_db():
                 last_screenshot_warning TEXT,
                 max_document_size_kib INTEGER NOT NULL DEFAULT 512
                     CHECK (max_document_size_kib BETWEEN 512 AND 1024),
+                max_document_size_bytes INTEGER NOT NULL DEFAULT 2097152
+                    CHECK (max_document_size_bytes BETWEEN 524288 AND 4194304),
                 is_hidden INTEGER NOT NULL DEFAULT 0 CHECK (is_hidden IN (0, 1)),
                 availability_state TEXT NOT NULL DEFAULT 'unknown'
                     CHECK (availability_state IN ('unknown', 'reachable', 'unreachable')),
@@ -650,6 +677,18 @@ def init_db():
         ):
             if column_name not in website_columns:
                 db.execute(f"ALTER TABLE websites ADD COLUMN {column_name} {declaration}")
+        if "max_document_size_bytes" not in website_columns:
+            db.execute(
+                "ALTER TABLE websites ADD COLUMN max_document_size_bytes INTEGER NOT NULL "
+                "DEFAULT 2097152 CHECK (max_document_size_bytes BETWEEN 524288 AND 4194304)"
+            )
+            # Preserve custom legacy limits; upgrade the old 512 KiB default to
+            # the new bounded 2 MiB default so existing sites can handle larger HTML.
+            db.execute(
+                "UPDATE websites SET max_document_size_bytes = CASE "
+                "WHEN max_document_size_kib = 512 THEN 2097152 "
+                "ELSE max_document_size_kib * 1024 END"
+            )
         # An existing successful snapshot is evidence the page was reachable then.
         db.execute(
             "UPDATE websites SET availability_state = 'reachable' "
@@ -1272,9 +1311,9 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
 async def _render_page_text_async(start_url, selectors, preview, max_document_size_kib, deadline):
     """Render using cancellable, bounded async route fetches."""
     if (isinstance(max_document_size_kib, bool) or not isinstance(max_document_size_kib, int)
-            or not DEFAULT_DOCUMENT_LIMIT_KIB <= max_document_size_kib <= MAX_DOCUMENT_LIMIT_KIB):
+            or not MIN_DOCUMENT_LIMIT_KIB <= max_document_size_kib <= MAX_DOCUMENT_LIMIT_KIB):
         raise ValueError(
-            f"Main document limit must be between {DEFAULT_DOCUMENT_LIMIT_KIB} and "
+            f"Main document limit must be between {MIN_DOCUMENT_LIMIT_KIB} and "
             f"{MAX_DOCUMENT_LIMIT_KIB} KiB."
         )
     document_limit_bytes = max_document_size_kib * 1024
@@ -1354,7 +1393,8 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
     def finish_request_diagnostic(entry, phase):
         entry["phase"] = phase
         entry["elapsed_ms"] = min(
-            35_000, max(0, int((time.monotonic() - entry.pop("_started_at")) * 1000)),
+            RENDER_DEADLINE_SECONDS * 1000,
+            max(0, int((time.monotonic() - entry.pop("_started_at")) * 1000)),
         )
 
     def fetch_error_for_app(exc):
@@ -1369,6 +1409,9 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                 )
             return WebsiteHTTPError(f"The webpage returned HTTP {exc.status}.")
         if isinstance(exc, PublicFetchTimeout):
+            if (asyncio.get_running_loop().time() >= work_deadline
+                    or "render deadline expired" in str(exc).lower()):
+                return render_deadline_error()
             return WebsiteTimeoutError(str(exc))
         if isinstance(exc, PublicFetchTLSFailure):
             return ValueError(str(exc))
@@ -1400,16 +1443,14 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
             try:
                 launch_timeout_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
                 if launch_timeout_ms <= 0:
-                    raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                    raise render_deadline_error()
                 browser = await playwright.chromium.launch(
                     timeout=launch_timeout_ms,
                     **chromium_headless_launch_options(playwright.chromium),
                 )
             except Exception as exc:
                 if asyncio.get_running_loop().time() >= work_deadline:
-                    raise WebsiteTimeoutError(
-                        "The webpage exceeded the 35-second render limit."
-                    ) from exc
+                    raise render_deadline_error() from exc
                 log_renderer_exception("chromium_launch", start_url, exc)
                 raise WebsiteTemporaryError(
                     "The webpage could not be rendered. Check the browser installation and try again."
@@ -1437,7 +1478,7 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                         if asyncio.get_running_loop().time() >= work_deadline:
                             if is_main_frame_navigation(req):
                                 fatal_document_error.append(WebsiteTimeoutError(
-                                    "The webpage exceeded the 35-second render limit."
+                                    render_deadline_error()
                                 ))
                             await route.abort()
                             return
@@ -1536,7 +1577,7 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                 try:
                     remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
                     if remaining_ms <= 0:
-                        raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                        raise render_deadline_error()
                     async with asyncio.timeout_at(work_deadline):
                         # `domcontentloaded` can wait for deferred scripts and other
                         # subresources. Their routes are deliberately fetched by our
@@ -1557,7 +1598,10 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                         elapsed = entry.get("elapsed_ms", 0)
                         if "_started_at" in entry:
                             pending_count += 1
-                            elapsed = min(35_000, max(0, int((now - entry["_started_at"]) * 1000)))
+                            elapsed = min(
+                                RENDER_DEADLINE_SECONDS * 1000,
+                                max(0, int((now - entry["_started_at"]) * 1000)),
+                            )
                         safe_trace.append({
                             "host": entry["host"],
                             "resource_type": entry["resource_type"],
@@ -1567,14 +1611,17 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                         })
                     render_logger.warning(
                         "navigation_timeout phase=commit elapsed_ms=%d routed_requests=%d pending_requests=%d recent_requests=%s",
-                        min(35_000, max(0, int((asyncio.get_running_loop().time() - render_started) * 1000))),
+                        min(
+                            RENDER_DEADLINE_SECONDS * 1000,
+                            max(0, int((asyncio.get_running_loop().time() - render_started) * 1000)),
+                        ),
                         request_count,
                         pending_count,
                         json.dumps(safe_trace, ensure_ascii=True, separators=(",", ":")),
                     )
-                    raise WebsiteTimeoutError("The webpage took too long to render. Try again later.") from exc
+                    raise render_deadline_error() from exc
                 except asyncio.TimeoutError as exc:
-                    raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.") from exc
+                    raise render_deadline_error() from exc
                 except Exception as exc:
                     if fatal_document_error:
                         raise fatal_document_error[0] from exc
@@ -1606,7 +1653,7 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                     raise WebsiteSelectorError(selector_result["error"])
                 remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
                 if remaining_ms <= 0:
-                    raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                    raise render_deadline_error()
                 text = await page.locator("body").inner_text(timeout=min(5000, remaining_ms))
                 if not text:
                     raise ValueError("No readable text was found on this webpage.")
@@ -1616,7 +1663,7 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                     try:
                         remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
                         if remaining_ms <= 0:
-                            raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                            raise render_deadline_error()
                         observed = (await page.locator(selector).first.inner_text(
                             timeout=min(1000, remaining_ms)
                         )).strip()
@@ -1634,7 +1681,7 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
                 try:
                     remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
                     if remaining_ms <= 0:
-                        raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                        raise render_deadline_error()
                     image = await page.screenshot(
                         type="jpeg", quality=65, full_page=False, timeout=min(5000, remaining_ms),
                     )
@@ -1673,7 +1720,7 @@ async def _render_page_text_async(start_url, selectors, preview, max_document_si
             WebsiteTimeoutError, WebsiteResourceLimitError, WebsiteSelectorError, ValueError):
         raise
     except asyncio.TimeoutError as exc:
-        raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.") from exc
+        raise render_deadline_error() from exc
     except Exception as exc:
         log_renderer_exception("browser_session", start_url, exc)
         raise WebsiteTemporaryError(
@@ -1750,6 +1797,9 @@ def website_for_ui(db, row):
     site = dict(row)
     # The visibility column belongs to the legacy password-watchlist schema.
     site.pop("visibility", None)
+    if site.get("max_document_size_bytes") is not None:
+        site["max_document_size_kib"] = site["max_document_size_bytes"] // 1024
+    site.pop("max_document_size_bytes", None)
     for field in ("watched_selectors", "ignored_selectors", "alert_keywords", "numeric_selectors"):
         try:
             parsed = json.loads(site.get(field) or "[]")
@@ -2838,16 +2888,18 @@ def update_website_settings(website_id):
         return jsonify(error=f"Choose a website interval from {MIN_WEBSITE_INTERVAL_MINUTES} to {MAX_WEBSITE_INTERVAL_MINUTES} minutes."), 400
     with get_db() as db:
         existing = db.execute(
-            "SELECT unchanged_history_limit, changed_history_limit, serious_event_limit, change_sensitivity, check_interval_minutes, alert_keywords_enabled, alert_keywords, numeric_selectors, max_document_size_kib "
+            "SELECT unchanged_history_limit, changed_history_limit, serious_event_limit, change_sensitivity, check_interval_minutes, alert_keywords_enabled, alert_keywords, numeric_selectors, max_document_size_bytes "
             "FROM websites WHERE id = ?", (website_id,),
         ).fetchone()
         if existing is None:
             return jsonify(error="Website not found."), 404
-        document_limit_kib = data.get("max_document_size_kib", existing["max_document_size_kib"])
+        document_limit_kib = data.get(
+            "max_document_size_kib", existing["max_document_size_bytes"] // 1024,
+        )
         if (isinstance(document_limit_kib, bool) or not isinstance(document_limit_kib, int)
-                or not DEFAULT_DOCUMENT_LIMIT_KIB <= document_limit_kib <= MAX_DOCUMENT_LIMIT_KIB):
+                or not MIN_DOCUMENT_LIMIT_KIB <= document_limit_kib <= MAX_DOCUMENT_LIMIT_KIB):
             return jsonify(error=(
-                f"Main document limit must be from {DEFAULT_DOCUMENT_LIMIT_KIB} to "
+                f"Main document limit must be from {MIN_DOCUMENT_LIMIT_KIB} to "
                 f"{MAX_DOCUMENT_LIMIT_KIB} KiB."
             )), 400
         sensitivity = data.get("change_sensitivity", existing["change_sensitivity"])
@@ -2883,12 +2935,12 @@ def update_website_settings(website_id):
             "UPDATE websites SET display_name = ?, check_interval_minutes = ?, "
             "unchanged_history_limit = ?, changed_history_limit = ?, serious_event_limit = ?, "
             "change_sensitivity = ?, alert_keywords_enabled = ?, alert_keywords = ?, numeric_selectors = ?, "
-            "max_document_size_kib = ? "
+            "max_document_size_kib = ?, max_document_size_bytes = ? "
             "WHERE id = ?",
             (name.strip(), interval, retention["unchanged_history_limit"],
              retention["changed_history_limit"], retention["serious_event_limit"], sensitivity,
              int(keywords_enabled), json.dumps(keywords), json.dumps(numeric_selectors),
-             document_limit_kib, website_id),
+             min(document_limit_kib, 1024), document_limit_kib * 1024, website_id),
         )
         # A queued scheduled check carries the old due decision. Cancel only
         # scheduled work when its interval changes; manual requests stay valid.
@@ -2953,9 +3005,10 @@ def preview_website_regions(website_id):
         try:
             selectors = {"watched": json.loads(site["watched_selectors"]),
                          "ignored": json.loads(site["ignored_selectors"])}
+            document_limit_kib = site["max_document_size_bytes"] // 1024
             document_limit_options = (
-                {"max_document_size_kib": site["max_document_size_kib"]}
-                if site["max_document_size_kib"] != DEFAULT_DOCUMENT_LIMIT_KIB else {}
+                {"max_document_size_kib": document_limit_kib}
+                if document_limit_kib != DEFAULT_DOCUMENT_LIMIT_KIB else {}
             )
             # The picker needs an unfiltered preview so stale saved selectors can
             # be repaired or removed instead of trapping the user in an error.
@@ -3349,13 +3402,13 @@ def _check_site_unlocked(website_id):
                     "ignored": json.loads(site["ignored_selectors"] or "[]"),
                     "numeric": json.loads(site["numeric_selectors"] or "[]"),
                 }
-                cache_key = (*normalized_render_key(site["url"], selectors),
-                             site["max_document_size_kib"])
+                document_limit_kib = site["max_document_size_bytes"] // 1024
+                cache_key = (*normalized_render_key(site["url"], selectors), document_limit_kib)
                 def fetch_rendered_page():
                     reserve_domain_slot(site["url"])
                     document_limit_options = (
-                        {"max_document_size_kib": site["max_document_size_kib"]}
-                        if site["max_document_size_kib"] != DEFAULT_DOCUMENT_LIMIT_KIB else {}
+                        {"max_document_size_kib": document_limit_kib}
+                        if document_limit_kib != DEFAULT_DOCUMENT_LIMIT_KIB else {}
                     )
                     page = (render_page_text(
                                 site["url"], selectors=selectors, **document_limit_options,

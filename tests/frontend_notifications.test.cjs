@@ -47,14 +47,18 @@ class MockElement {
     const found = [];
     const visit = (node) => {
       for (const child of node.children || []) {
-        if (child.selector === selector) found.push(child);
+        if (child.selector === selector || (selector.startsWith('.')
+            && child.className?.split(' ').includes(selector.slice(1)))) found.push(child);
         visit(child);
       }
     };
     visit(this);
     return found;
   }
-  replaceChildren(...children) { this.children = [...children]; }
+  replaceChildren(...children) {
+    this.children = [...children];
+    children.forEach((child) => { child.parentNode = this; });
+  }
   focus() { this.focused = true; }
   showModal() { this.open = true; }
   close() { this.open = false; this.listeners.get('close')?.(); }
@@ -71,6 +75,7 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
   const notifications = [];
   let permissionRequests = 0;
   let schedulePoll;
+  const timeoutDurations = [];
   let scheduleResponse = {
     enabled: true,
     interval_minutes: 1,
@@ -88,6 +93,7 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
   const alertSaves = [];
   const confirmations = [];
   let loadedSites = sites;
+  let websiteListRequestGate = null;
   const loadedAlertSettings = alertSettings || {
     email_enabled: false, email_recipient: '', email_configured: false, email_status: 'SMTP not configured',
     webhook_enabled: false, webhook_configured: false, webhook_chat_id: '',
@@ -106,7 +112,7 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
   const window = {
     isSecureContext: true,
     matchMedia: () => ({ matches: false }),
-    setTimeout: () => 1,
+    setTimeout: (_callback, timeoutMs) => { timeoutDurations.push(timeoutMs); return 1; },
     clearTimeout() {},
     setInterval(callback) { schedulePoll = callback; return 1; },
     confirm(message) { confirmations.push(message); return confirmResult; },
@@ -203,7 +209,15 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
       selectorSaves.push(JSON.parse(options.body));
       payload = {};
     }
-    else if (url.startsWith('/api/websites')) payload = loadedSites;
+    else if (url.startsWith('/api/websites')) {
+      payload = loadedSites;
+      if (websiteListRequestGate) {
+        const gate = websiteListRequestGate;
+        websiteListRequestGate = null;
+        gate.started();
+        await new Promise((resolve) => { gate.release = resolve; });
+      }
+    }
     else if (url.startsWith('/api/stats')) {
       payload = { websites: 0, successful_checks: 0, detected_changes: 0, demo_runs: 0 };
     } else payload = {};
@@ -244,6 +258,7 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
     legacyHistoryRequests,
     selectorSaves,
     requests,
+    timeoutDurations,
     alertSaves,
     confirmations,
     storage,
@@ -251,6 +266,13 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
     get schedulePoll() { return schedulePoll; },
     setEvents(value, total = value.length) { notificationEvents = value; notificationTotal = total; },
     setSchedule(value) { scheduleResponse = value; },
+    deferNextWebsiteListRequest() {
+      let announceStarted;
+      const started = new Promise((resolve) => { announceStarted = resolve; });
+      const gate = { started: announceStarted, release: null };
+      websiteListRequestGate = gate;
+      return { started, resolve() { gate.release(); } };
+    },
     async start() { await settle(); },
     async poll() { await schedulePoll(); },
     async clickNotificationPermission() {
@@ -418,12 +440,56 @@ test('Check All gets both website lists, fetches a fresh CSRF token, checks site
   assert.ok(harness.requests.some(({ url }) => url === '/api/websites?hidden=false'));
   assert.equal(harness.requests.filter(({ url }) => url === '/api/websites?hidden=true').length, 1);
   assert.equal(harness.requests.filter(({ url }) => url === '/auth/csrf').length, 1);
+  assert.ok(harness.timeoutDurations.includes(135000), 'check requests must outlive the server maximum render deadline');
   assert.deepEqual(harness.requests.filter(({ method, url }) => method === 'POST' && url.startsWith('/api/websites/')), [
     { url: '/api/websites/41/check', method: 'POST' },
   ]);
   assert.ok(harness.requests.some(({ url }) => url === '/api/stats'));
   assert.ok(initialDashboardRequests.some(({ url }) => url.startsWith('/api/notifications')));
   assert.match(harness.elements.get('#check-all-status').textContent, /1 successful, 0 changed websites, 0 failed/);
+});
+
+test('watchlist polling does not replace an open More menu during an active check', async () => {
+  const harness = makeHarness({ sites: [
+    { id: 42, url: 'https://news.example/', display_name: 'News', is_demo: false,
+      active_check_job: { status: 'running' } },
+  ] });
+  await harness.start();
+  const row = findBy(harness.elements.get('#website-list'), (node) => node.className === 'website-row');
+  const menu = findBy(row, (node) => node.className === 'site-more-menu');
+  assert.ok(menu);
+  menu.open = true;
+  const websiteListRequests = () => harness.requests.filter(({ url }) => url.startsWith('/api/websites')).length;
+  const requestsBeforePoll = websiteListRequests();
+
+  await harness.poll();
+  assert.equal(menu.open, true);
+  assert.equal(websiteListRequests(), requestsBeforePoll);
+
+  menu.open = false;
+  await harness.poll();
+  assert.ok(websiteListRequests() > requestsBeforePoll, 'watchlist refresh resumes after the menu closes');
+});
+
+test('watchlist polling keeps an open More menu if its refresh was already in flight', async () => {
+  const harness = makeHarness({ sites: [
+    { id: 43, url: 'https://news.example/', display_name: 'News', is_demo: false,
+      active_check_job: { status: 'running' } },
+  ] });
+  await harness.start();
+  const gate = harness.deferNextWebsiteListRequest();
+  const polling = harness.poll();
+  await gate.started;
+
+  const list = harness.elements.get('#website-list');
+  const row = findBy(list, (node) => node.className === 'website-row');
+  const menu = findBy(row, (node) => node.className === 'site-more-menu');
+  menu.open = true;
+  gate.resolve();
+  await polling;
+
+  assert.ok(findBy(list, (node) => node === menu), 'the response must not detach the open menu');
+  assert.equal(menu.open, true);
 });
 
 function event(id, eventType) {
@@ -768,7 +834,7 @@ test('compact website rows keep primary actions visible and management actions i
   assert.ok(sensitivity);
   assert.deepEqual(sensitivity.children.map((option) => option.value), ['low', 'normal', 'high']);
   const documentLimit = findBy(settings, (node) => node.selector === 'input' && node.getAttribute('aria-label') === 'Main document limit in KiB');
-  assert.equal(documentLimit.value, '512');
+  assert.equal(documentLimit.value, '2048');
   const retentionInputs = findAll(settings, (node) => node.selector === 'input' && node.attributes.has('aria-label')
     && node.getAttribute('aria-label') !== 'Main document limit in KiB');
   assert.deepEqual(retentionInputs.map((input) => input.value), ['17', '23', '29']);

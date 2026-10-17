@@ -333,7 +333,7 @@ def test_shared_cycle_does_not_reuse_render_for_incompatible_selectors(jobs_clie
         db.execute("INSERT INTO websites (url, created_at, display_name, owner_id) VALUES (?, ?, ?, 1)",
                    ("https://1.1.1.1:443#ignored-fragment", webwatch.utc_now(), "Selected region"))
         second_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-        db.execute("UPDATE websites SET watched_selectors='[\"main\"]', max_document_size_kib=768 WHERE id=?",
+        db.execute("UPDATE websites SET watched_selectors='[\"main\"]', max_document_size_kib=768, max_document_size_bytes=786432 WHERE id=?",
                    (second_id,))
     calls = []
     monkeypatch.setattr(webwatch, "reserve_domain_slot", lambda _url: None)
