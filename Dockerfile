@@ -28,5 +28,5 @@ RUN groupadd --system webwatch \
 
 USER webwatch
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 CMD python -c "import os,urllib.request; url='http://127.0.0.1:%s/healthz' % os.getenv('PORT', '3000'); urllib.request.urlopen(url, timeout=3).close()"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 CMD python -c "import os,urllib.request; url='http://127.0.0.1:%s/healthz' % (os.getenv('PORT') or '3000'); urllib.request.urlopen(url, timeout=3).close()"
 CMD ["sh", "-c", "exec python -m gunicorn --config gunicorn.conf.py --bind 0.0.0.0:${PORT:-3000} app:app"]

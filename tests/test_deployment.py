@@ -362,3 +362,42 @@ def test_healthcheck_endpoint_needs_no_auth_database_or_network(monkeypatch):
 
     assert response.status_code == 200
     assert response.data == b"ok\n"
+
+
+@pytest.mark.parametrize(
+    ("port", "expected_port"),
+    [(None, "3000"), ("", "3000"), ("8080", "8080")],
+    ids=["unset", "empty", "explicit"],
+)
+def test_docker_healthcheck_port_uses_gunicorn_fallback(monkeypatch, port, expected_port):
+    dockerfile = Path(__file__).parents[1] / "Dockerfile"
+    healthcheck = next(
+        line for line in dockerfile.read_text(encoding="utf-8").splitlines()
+        if line.startswith("HEALTHCHECK ")
+    )
+    command = healthcheck.split(" CMD ", 1)[1]
+    assert command.startswith('python -c "') and command.endswith('"')
+    probe_code = command[len('python -c "'):-1]
+
+    if port is None:
+        monkeypatch.delenv("PORT", raising=False)
+    else:
+        monkeypatch.setenv("PORT", port)
+
+    requests = []
+
+    class Response:
+        def close(self):
+            self.closed = True
+
+    response = Response()
+
+    def fake_urlopen(url, *, timeout):
+        requests.append((url, timeout))
+        return response
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    exec(compile(probe_code, str(dockerfile), "exec"), {})
+
+    assert requests == [(f"http://127.0.0.1:{expected_port}/healthz", 3)]
+    assert response.closed
