@@ -94,7 +94,9 @@ def test_sensitive_dashboard_and_resource_routes_require_authentication(tmp_path
     client = webwatch.app.test_client()
     protected_paths = set()
     for rule in webwatch.app.url_map.iter_rules():
-        if rule.rule.startswith(("/static/", "/auth/")) or rule.endpoint in {"login_page", "setup_page", "invite_page"}:
+        if rule.rule.startswith(("/static/", "/auth/")) or rule.endpoint in {
+            "healthcheck", "login_page", "setup_page", "invite_page",
+        }:
             continue
         protected_paths.add(re.sub(r"<(?:(?:[^:>]+):)?[^>]+>", "1", rule.rule))
     responses = [(path, client.get(path)) for path in sorted(protected_paths)]
@@ -102,6 +104,7 @@ def test_sensitive_dashboard_and_resource_routes_require_authentication(tmp_path
         (path, response.status_code) for path, response in responses if response.status_code not in {302, 401, 403}]
     assert client.get("/login").status_code == 200
     assert client.get("/auth/status").status_code == 200
+    assert client.get("/healthz").status_code == 200
 
 
 def test_delete_website_requires_csrf_and_persists_cascade(tmp_path, monkeypatch):

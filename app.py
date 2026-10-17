@@ -804,6 +804,8 @@ def require_same_origin_api_mutations():
 @app.before_request
 def initialize_database_for_all_flask_entrypoints():
     """Run additive schema setup even when launched with `flask --app app run`."""
+    if request.endpoint == "healthcheck":
+        return None
     ensure_db_initialized()
     cleanup_expired_guests_if_due()
 
@@ -812,7 +814,7 @@ def initialize_database_for_all_flask_entrypoints():
 def require_authenticated_owner_scope():
     """Make every non-auth application route private and validate nested IDs."""
     if (request.path.startswith(("/static/", "/auth/")) or
-            request.endpoint in {"login_page", "setup_page", "invite_page"}):
+            request.endpoint in {"healthcheck", "login_page", "setup_page", "invite_page"}):
         return None
     user = authenticated_user()
     if user is None:
@@ -845,6 +847,12 @@ def login_page():
     return render_template("auth.html", mode="login")
 
 
+@app.get("/healthz")
+def healthcheck():
+    """Answer container health probes without auth, database, or network work."""
+    return "ok\n", 200, {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"}
+
+
 @app.get("/setup")
 def setup_page():
     return render_template("auth.html", mode="setup")
@@ -863,7 +871,8 @@ def account_page():
 @app.before_request
 def start_scheduler_for_flask_cli():
     """Start the same single scheduler when launched through `flask run`."""
-    if os.environ.get("FLASK_RUN_FROM_CLI", "").lower() == "true":
+    if (request.endpoint != "healthcheck"
+            and os.environ.get("FLASK_RUN_FROM_CLI", "").lower() == "true"):
         start_scheduler()
 
 

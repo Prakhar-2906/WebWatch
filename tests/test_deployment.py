@@ -328,7 +328,21 @@ def test_voroa_docker_image_installs_linux_dependencies_in_the_runtime_image():
     assert "chown -R webwatch:webwatch /app/instance /app/.playwright-browsers" in dockerfile
     assert "--bind 0.0.0.0:${PORT:-3000}" in dockerfile
     assert "HEALTHCHECK --interval=30s" in dockerfile
-    assert "/auth/status" in dockerfile and "authentication_available" in dockerfile
+    assert "/healthz" in dockerfile and "/auth/status" not in dockerfile
     assert ".playwright-browsers" in dockerignore
     assert ".env" in dockerignore
     assert "*.sqlite3" in dockerignore
+
+
+def test_healthcheck_endpoint_needs_no_auth_database_or_network(monkeypatch):
+    monkeypatch.setitem(webwatch.app.config, "SECRET_KEY", None)
+    monkeypatch.setenv("FLASK_RUN_FROM_CLI", "true")
+    monkeypatch.setattr(webwatch, "ensure_db_initialized", lambda: pytest.fail("health check touched database"))
+    monkeypatch.setattr(webwatch, "cleanup_expired_guests_if_due", lambda: pytest.fail("health check touched database"))
+    monkeypatch.setattr(webwatch, "authenticated_user", lambda: pytest.fail("health check required auth"))
+    monkeypatch.setattr(webwatch, "start_scheduler", lambda: pytest.fail("health check started scheduler"))
+
+    response = webwatch.app.test_client().get("/healthz")
+
+    assert response.status_code == 200
+    assert response.data == b"ok\n"
