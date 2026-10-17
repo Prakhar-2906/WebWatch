@@ -1012,25 +1012,11 @@ def test_html_history_export_escapes_user_supplied_website_name(client, monkeypa
 
 def test_confirmed_http_denial_is_blocked_and_never_saved_as_page_text(client, monkeypatch):
     website_id = add_test_website(client)
-    monkeypatch.setattr(webwatch, "validated_http_url", lambda _url: ("https://1.1.1.1/", "1.1.1.1", {"1.1.1.1"}))
+    async def denied_fetch(*_args, **_kwargs):
+        from async_public_fetch import PublicHTTPError
+        raise PublicHTTPError(403)
 
-    class DeniedResponse:
-        status_code = 403
-        headers = {}
-        def __enter__(self): return self
-        def __exit__(self, *_args): return False
-        def raise_for_status(self):
-            import requests
-            raise requests.HTTPError("forbidden", response=self)
-
-    class DeniedSession:
-        trust_env = False
-        def __enter__(self): return self
-        def __exit__(self, *_args): return False
-        def mount(self, *_args): pass
-        def get(self, *_args, **_kwargs): return DeniedResponse()
-
-    monkeypatch.setattr(webwatch.requests, "Session", DeniedSession)
+    monkeypatch.setattr(webwatch, "fetch_public_resource_async", denied_fetch)
     result = client.post(f"/api/websites/{website_id}/check")
     assert result.status_code == 502
     assert "HTTP 403" in result.get_json()["error"]

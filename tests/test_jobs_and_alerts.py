@@ -460,11 +460,11 @@ def test_numeric_selector_fixture_flows_from_render_to_saved_chart_points(jobs_c
     )
     fetched = []
 
-    def fixture_resource(url, **_kwargs):
+    async def fixture_resource(url, **_kwargs):
         fetched.append(url)
         return html, {"Content-Type": "text/html; charset=utf-8"}, url
 
-    monkeypatch.setattr(webwatch, "fetch_public_resource", fixture_resource)
+    monkeypatch.setattr(webwatch, "fetch_public_resource_async", fixture_resource)
     monkeypatch.setattr(webwatch, "reserve_domain_slot", lambda _url: None)
 
     first = client.post(f"/api/websites/{site_id}/check")

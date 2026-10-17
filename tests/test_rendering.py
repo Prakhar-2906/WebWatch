@@ -1,11 +1,20 @@
 """Playwright rendering tests with all network responses supplied locally."""
 
 import sys
+import asyncio
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 import app as webwatch
+
+
+def patch_resource_fetch(monkeypatch, fetcher):
+    async def fetch(url, **kwargs):
+        kwargs.pop("validate_url", None)
+        kwargs.pop("deadline", None)
+        return fetcher(url, **kwargs)
+    monkeypatch.setattr(webwatch, "fetch_public_resource_async", fetch)
 
 
 def test_render_timeout_diagnostic_exposes_only_bounded_public_request_metadata():
@@ -36,27 +45,27 @@ def test_chromium_launch_failure_logs_type_and_redacted_message(monkeypatch, cap
         )
 
         @staticmethod
-        def launch(**kwargs):
+        async def launch(**kwargs):
             launch_options.append(kwargs)
             raise RuntimeError(
                 "launch failed at https://user:password@auth.example/private/page?token=topsecret "
                 "Authorization: Bearer api-secret"
             )
 
-    class SyncManager:
-        def __enter__(self):
+    class AsyncManager:
+        async def __aenter__(self):
             return SimpleNamespace(chromium=Chromium())
 
-        def __exit__(self, *_args):
+        async def __aexit__(self, *_args):
             return False
 
     playwright_package = ModuleType("playwright")
     playwright_package.__path__ = []
-    sync_api = ModuleType("playwright.sync_api")
-    sync_api.sync_playwright = SyncManager
-    sync_api.TimeoutError = type("PlaywrightTimeoutError", (Exception,), {})
+    async_api = ModuleType("playwright.async_api")
+    async_api.async_playwright = AsyncManager
+    async_api.TimeoutError = type("PlaywrightTimeoutError", (Exception,), {})
     monkeypatch.setitem(sys.modules, "playwright", playwright_package)
-    monkeypatch.setitem(sys.modules, "playwright.sync_api", sync_api)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api)
 
     with caplog.at_level("WARNING", logger="webwatch.render"):
         with pytest.raises(webwatch.WebsiteTemporaryError, match="Check the browser installation"):
@@ -94,7 +103,7 @@ def test_rendered_javascript_text_and_private_subresource_blocking(monkeypatch):
         "getaddrinfo",
         lambda host, port, type: [(None, None, None, None, ("93.184.216.34", port))],
     )
-    monkeypatch.setattr(webwatch, "fetch_public_resource", safe_resource)
+    patch_resource_fetch(monkeypatch, safe_resource)
 
     text = webwatch.render_page_text("https://example.com/start")
 
@@ -116,8 +125,8 @@ def test_rendered_challenge_is_rejected(monkeypatch):
     )
     monkeypatch.setattr(
         webwatch,
-        "fetch_public_resource",
-        lambda url, **_kwargs: (html, {"Content-Type": "text/html"}, url),
+        "fetch_public_resource_async",
+        lambda url, **_kwargs: asyncio.sleep(0, result=(html, {"Content-Type": "text/html"}, url)),
     )
 
     with pytest.raises(webwatch.WebsiteBlockedError, match="No page snapshot was saved"):
@@ -129,8 +138,8 @@ def test_playwright_capture_screenshot_and_apply_saved_regions_safely(monkeypatc
       <main><article id='policy'>Policy is open</article><time id='clock'>Updated 4 minutes ago</time></main>
       <aside>Sponsored content</aside></body></html>"""
     monkeypatch.setattr(
-        webwatch, "fetch_public_resource",
-        lambda url, **_kwargs: (html, {"Content-Type": "text/html"}, url),
+        webwatch, "fetch_public_resource_async",
+        lambda url, **_kwargs: asyncio.sleep(0, result=(html, {"Content-Type": "text/html"}, url)),
     )
 
     rendered = webwatch.render_page_text("https://example.com/", selectors={
@@ -164,7 +173,7 @@ def test_failed_third_party_iframe_does_not_discard_main_page_content(monkeypatc
             raise webwatch.WebsiteHTTPError("The webpage returned HTTP 500.")
         pytest.fail(f"Unexpected resource URL: {url}")
 
-    monkeypatch.setattr(webwatch, "fetch_public_resource", safe_resource)
+    patch_resource_fetch(monkeypatch, safe_resource)
 
     result = webwatch.render_page_text(main_url)
 
@@ -184,7 +193,7 @@ def test_per_site_document_limit_does_not_raise_subresource_limit(monkeypatch):
             )
         return b"document.body.dataset.loaded='true';", {"Content-Type": "application/javascript"}, url
 
-    monkeypatch.setattr(webwatch, "fetch_public_resource", safe_resource)
+    patch_resource_fetch(monkeypatch, safe_resource)
     result = webwatch.render_page_text("https://example.com/", max_document_size_kib=768)
 
     assert "Page content" in result
@@ -194,7 +203,7 @@ def test_per_site_document_limit_does_not_raise_subresource_limit(monkeypatch):
 
 def test_document_size_failure_names_the_configured_limit(monkeypatch):
     monkeypatch.setattr(
-        webwatch, "fetch_public_resource",
+        webwatch, "fetch_public_resource_async",
         lambda _url, **_kwargs: (_ for _ in ()).throw(
             ValueError("The webpage resource is too large to check.")
         ),
@@ -216,7 +225,7 @@ def test_oversized_optional_subresource_does_not_discard_main_document(monkeypat
             )
         raise ValueError("The webpage resource is too large to check.")
 
-    monkeypatch.setattr(webwatch, "fetch_public_resource", safe_resource)
+    patch_resource_fetch(monkeypatch, safe_resource)
     result = webwatch.render_page_text("https://example.com/")
 
     assert "Usable page content" in result
@@ -238,7 +247,7 @@ def test_aggregate_budget_skips_optional_subresources_and_keeps_document(monkeyp
         total_bytes += len(body)
         return body, {"Content-Type": "text/html" if require_html else "application/javascript"}, url
 
-    monkeypatch.setattr(webwatch, "fetch_public_resource", bounded_resource)
+    patch_resource_fetch(monkeypatch, bounded_resource)
     result = webwatch.render_page_text("https://example.com/")
 
     assert "Aggregate budget page" in result
@@ -248,8 +257,8 @@ def test_aggregate_budget_skips_optional_subresources_and_keeps_document(monkeyp
 
 def test_playwright_invalid_watched_selector_returns_clear_error(monkeypatch):
     html = b"<html><body><main>Page content</main></body></html>"
-    monkeypatch.setattr(
-        webwatch, "fetch_public_resource",
+    patch_resource_fetch(
+        monkeypatch,
         lambda url, **_kwargs: (html, {"Content-Type": "text/html"}, url),
     )
 
@@ -257,17 +266,116 @@ def test_playwright_invalid_watched_selector_returns_clear_error(monkeypatch):
         webwatch.render_page_text("https://example.com/", selectors={"watched": ["[broken"], "ignored": []})
 
 
-def test_playwright_resource_limit_returns_clear_error_not_type_error(monkeypatch):
-    def navigating_fixture(url, **_kwargs):
-        html = (
-            b"<html><body><script>"
-            b"const n=Number(location.pathname.slice(1)||0);"
-            + f"if(n<{webwatch.MAX_RENDER_REQUESTS + 10})setTimeout(()=>location.href='/' +(n+1),0);".encode()
-            + b"</script>fixture</body></html>"
-        )
-        return html, {"Content-Type": "text/html"}, url
+def test_playwright_resource_limit_caps_subresource_requests(monkeypatch):
+    images = "".join(
+        f"<img src='/asset-{index}.png'>"
+        for index in range(webwatch.MAX_RENDER_REQUESTS + 10)
+    )
+    html = f"<html><body><main>Request capped</main>{images}</body></html>".encode()
+    requested = []
 
-    monkeypatch.setattr(webwatch, "fetch_public_resource", navigating_fixture)
+    def fixture_resource(url, **_kwargs):
+        requested.append(url)
+        if url == "https://fixture.example/":
+            return html, {"Content-Type": "text/html"}, url
+        return b"image", {"Content-Type": "image/png"}, url
 
-    with pytest.raises(webwatch.WebsiteResourceLimitError, match="requested too many resources"):
-        webwatch.render_page_text("https://fixture.example/0")
+    patch_resource_fetch(monkeypatch, fixture_resource)
+    result = webwatch.render_page_text("https://fixture.example/")
+
+    assert "Request capped" in result
+    assert len(requested) <= webwatch.MAX_RENDER_REQUESTS
+
+
+def test_fast_main_document_remains_responsive_while_slow_subresource_fetches(monkeypatch):
+    event_loop_responsive = asyncio.Event()
+    cancelled = asyncio.Event()
+    requested = []
+
+    async def safe_resource(url, **_kwargs):
+        requested.append(url)
+        if url == "https://example.com/":
+            async def tick():
+                await asyncio.sleep(0.03)
+                event_loop_responsive.set()
+            asyncio.create_task(tick())
+            return (b"<html><body><script defer src='/slow.js'></script>Shell</body></html>",
+                    {"Content-Type": "text/html"}, url)
+        assert url == "https://example.com/slow.js"
+        await asyncio.wait_for(event_loop_responsive.wait(), timeout=0.2)
+        try:
+            await asyncio.sleep(2)
+            return (b"document.body.insertAdjacentHTML('beforeend','<p>Loaded</p>');",
+                    {"Content-Type": "application/javascript"}, url)
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(webwatch, "fetch_public_resource_async", safe_resource)
+    result = webwatch.render_page_text("https://example.com/")
+
+    assert "Shell" in result and "Loaded" not in result
+    assert requested == ["https://example.com/", "https://example.com/slow.js"]
+    assert event_loop_responsive.is_set()
+    assert cancelled.is_set()
+
+
+def test_render_timeout_cancels_pending_route_and_releases_renderer_slot(monkeypatch):
+    cancelled = asyncio.Event()
+    # Browser startup on CI can take a few seconds; the route itself remains
+    # blocked far beyond the 5-second end-to-end deadline.
+    monkeypatch.setattr(webwatch, "RENDER_DEADLINE_SECONDS", 5)
+    monkeypatch.setattr(webwatch, "RENDER_CLEANUP_RESERVE_SECONDS", 0.5)
+
+    async def slow_resource(url, **_kwargs):
+        try:
+            await asyncio.sleep(30)
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(webwatch, "fetch_public_resource_async", slow_resource)
+    with pytest.raises(webwatch.WebsiteTimeoutError):
+        webwatch.render_page_text("https://example.com/")
+    assert cancelled.is_set()
+
+    monkeypatch.setattr(
+        webwatch, "fetch_public_resource_async",
+        lambda url, **_kwargs: asyncio.sleep(0, result=(
+            b"<html><body>Recovered after timeout</body></html>",
+            {"Content-Type": "text/html"}, url,
+        )),
+    )
+    assert "Recovered after timeout" in webwatch.render_page_text("https://example.com/")
+
+
+def test_concurrent_subresources_obey_bounded_fetch_and_aggregate_byte_budget(monkeypatch):
+    images = "".join(f"<img src='/asset-{index}.png'>" for index in range(24))
+    html = f"<html><body><main>Budget page</main>{images}</body></html>".encode()
+    active = 0
+    maximum_active = 0
+    consumed = 0
+    guard = asyncio.Lock()
+
+    async def bounded_resource(url, max_bytes, require_html=False, **_kwargs):
+        nonlocal active, maximum_active, consumed
+        if require_html:
+            body = html
+        else:
+            async with guard:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                await asyncio.sleep(0.02)
+                body = b"x" * max_bytes
+            finally:
+                async with guard:
+                    active -= 1
+        async with guard:
+            consumed += len(body)
+        return body, {"Content-Type": "text/html" if require_html else "image/png"}, url
+
+    monkeypatch.setattr(webwatch, "fetch_public_resource_async", bounded_resource)
+    result = webwatch.render_page_text("https://example.com/")
+
+    assert "Budget page" in result
+    assert maximum_active <= 4
+    assert consumed <= 8 * 1024 * 1024

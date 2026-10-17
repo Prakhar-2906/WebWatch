@@ -1,6 +1,7 @@
 """Flask routes and small SQLite data helpers for WebWatch."""
 
 import difflib
+import asyncio
 from email.utils import format_datetime
 from xml.etree.ElementTree import Element, SubElement, tostring
 import contextvars
@@ -30,6 +31,14 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from uuid import uuid4
 
 import requests
+from async_public_fetch import (
+    fetch_public_resource_async,
+    PublicHTTPError,
+    PublicFetchTimeout,
+    PublicFetchTLSFailure,
+    PublicFetchUnreachable,
+    ResourceTooLarge,
+)
 from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request, redirect, url_for, g
 from requests.exceptions import (
@@ -225,6 +234,8 @@ _shared_render_flights_guard = threading.Lock()
 _shared_render_flights = {}
 _browser_render_slots = threading.BoundedSemaphore(1)
 BROWSER_RENDER_SLOT_WAIT_SECONDS = 40
+RENDER_DEADLINE_SECONDS = 35
+RENDER_CLEANUP_RESERVE_SECONDS = 2
 render_logger = logging.getLogger("webwatch.render")
 
 
@@ -1214,22 +1225,42 @@ def fetch_public_resource(start_url, accept="*/*", max_bytes=512 * 1024, require
 def render_page_text(start_url, selectors=None, preview=False,
                      max_document_size_kib=DEFAULT_DOCUMENT_LIMIT_KIB):
     """Limit Chromium to one concurrent session to bound memory on small hosts."""
-    if not _browser_render_slots.acquire(timeout=BROWSER_RENDER_SLOT_WAIT_SECONDS):
+    deadline = time.monotonic() + RENDER_DEADLINE_SECONDS
+    remaining = max(0, deadline - time.monotonic())
+    if not _browser_render_slots.acquire(timeout=min(BROWSER_RENDER_SLOT_WAIT_SECONDS, remaining)):
         error = WebsiteTemporaryError("The browser renderer is busy. Try this check again shortly.")
         log_renderer_exception("renderer_slot_wait", start_url, error)
         raise error
     try:
         return _render_page_text_with_browser(
             start_url, selectors=selectors, preview=preview,
-            max_document_size_kib=max_document_size_kib,
+            max_document_size_kib=max_document_size_kib, deadline=deadline,
         )
     finally:
         _browser_render_slots.release()
 
 
 def _render_page_text_with_browser(start_url, selectors=None, preview=False,
-                                   max_document_size_kib=DEFAULT_DOCUMENT_LIMIT_KIB):
-    """Render JavaScript pages while routing every network resource through SSRF checks."""
+                                   max_document_size_kib=DEFAULT_DOCUMENT_LIMIT_KIB,
+                                   deadline=None):
+    """Run the async renderer behind the existing synchronous Flask interface."""
+    deadline = deadline or (time.monotonic() + RENDER_DEADLINE_SECONDS)
+    try:
+        return asyncio.run(_render_page_text_async(
+            start_url, selectors, preview, max_document_size_kib, deadline,
+        ))
+    except (WebsiteBlockedError, WebsiteUnreachableError, WebsiteTemporaryError,
+            WebsiteTimeoutError, WebsiteResourceLimitError, WebsiteSelectorError, ValueError):
+        raise
+    except Exception as exc:
+        log_renderer_exception("browser_session", start_url, exc)
+        raise WebsiteTemporaryError(
+            "The webpage could not be rendered. Check the browser installation and try again."
+        ) from exc
+
+
+async def _render_page_text_async(start_url, selectors, preview, max_document_size_kib, deadline):
+    """Render using cancellable, bounded async route fetches."""
     if (isinstance(max_document_size_kib, bool) or not isinstance(max_document_size_kib, int)
             or not DEFAULT_DOCUMENT_LIMIT_KIB <= max_document_size_kib <= MAX_DOCUMENT_LIMIT_KIB):
         raise ValueError(
@@ -1238,21 +1269,52 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
         )
     document_limit_bytes = max_document_size_kib * 1024
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+        from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
         raise ValueError(
             "JavaScript rendering is unavailable. Install the project dependencies and run 'python tools/install_playwright_browser.py'."
         ) from exc
 
     request_count = 0
-    total_bytes = 0
     resource_budget = 8 * 1024 * 1024
+    available_bytes = resource_budget
+    inflight_reservations = 0
+    budget_condition = asyncio.Condition()
+    fetch_slots = asyncio.Semaphore(4)
     fatal_document_error = []
-    render_started = time.monotonic()
+    render_started = asyncio.get_running_loop().time()
+    work_deadline = deadline - RENDER_CLEANUP_RESERVE_SECONDS
     request_trace = deque(maxlen=24)
+    active_route_tasks = set()
+    browser = None
+    context = None
 
-    def deny_socket(websocket):
-        websocket.close(code=1008, reason="WebSockets are disabled for safe monitoring.")
+    async def reserve_bytes(requested):
+        nonlocal available_bytes, inflight_reservations
+        async with budget_condition:
+            while available_bytes <= 0 and inflight_reservations:
+                remaining = work_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(budget_condition.wait(), remaining)
+            if available_bytes <= 0:
+                return 0
+            reserved = min(requested, available_bytes)
+            available_bytes -= reserved
+            inflight_reservations += 1
+            return reserved
+
+    async def settle_bytes(reserved, consumed):
+        nonlocal available_bytes, inflight_reservations
+        if not reserved:
+            return
+        async with budget_condition:
+            available_bytes += reserved - consumed
+            inflight_reservations -= 1
+            budget_condition.notify_all()
+
+    async def deny_socket(websocket):
+        await websocket.close(code=1008, reason="WebSockets are disabled for safe monitoring.")
 
     def is_main_frame_navigation(req):
         if not req.is_navigation_request():
@@ -1285,56 +1347,125 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
             35_000, max(0, int((time.monotonic() - entry.pop("_started_at")) * 1000)),
         )
 
+    def fetch_error_for_app(exc):
+        if isinstance(exc, PublicHTTPError):
+            if exc.status == 429:
+                return WebsiteRateLimitedError(
+                    "The website rate-limited this check (HTTP 429). No page snapshot was saved."
+                )
+            if exc.status in {401, 403}:
+                return WebsiteBlockedError(
+                    f"The website denied this check (HTTP {exc.status}). No page snapshot was saved."
+                )
+            return WebsiteHTTPError(f"The webpage returned HTTP {exc.status}.")
+        if isinstance(exc, PublicFetchTimeout):
+            return WebsiteTimeoutError(str(exc))
+        if isinstance(exc, PublicFetchTLSFailure):
+            return ValueError(str(exc))
+        if isinstance(exc, PublicFetchUnreachable):
+            return WebsiteUnreachableError(str(exc))
+        return exc
+
+    async def abort_route(route):
+        try:
+            await route.abort()
+        except Exception:
+            # The browser may already have cancelled this route during teardown.
+            pass
+
+    async def close_with_deadline(close_operation, phase):
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(close_operation(), remaining)
+        except Exception as exc:
+            render_logger.warning(
+                "renderer_cleanup_failure phase=%s exception_type=%s",
+                phase, type(exc).__name__,
+            )
+
     try:
-        with sync_playwright() as playwright:
+        async with async_playwright() as playwright:
             try:
-                browser = playwright.chromium.launch(
+                launch_timeout_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
+                if launch_timeout_ms <= 0:
+                    raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                browser = await playwright.chromium.launch(
+                    timeout=launch_timeout_ms,
                     **chromium_headless_launch_options(playwright.chromium),
                 )
             except Exception as exc:
+                if asyncio.get_running_loop().time() >= work_deadline:
+                    raise WebsiteTimeoutError(
+                        "The webpage exceeded the 35-second render limit."
+                    ) from exc
                 log_renderer_exception("chromium_launch", start_url, exc)
                 raise WebsiteTemporaryError(
                     "The webpage could not be rendered. Check the browser installation and try again."
                 ) from exc
             try:
-                context = browser.new_context(service_workers="block", accept_downloads=False)
-                context.route_web_socket("**/*", deny_socket)
+                context = await browser.new_context(service_workers="block", accept_downloads=False)
+                await context.route_web_socket("**/*", deny_socket)
 
-                def fulfill_safely(route):
-                    nonlocal request_count, total_bytes
+                async def fulfill_safely(route):
+                    nonlocal request_count
+                    current_task = asyncio.current_task()
+                    active_route_tasks.add(current_task)
                     req = route.request
-                    if req.method not in {"GET", "HEAD"} or req.resource_type not in {
-                        "document", "script", "stylesheet", "xhr", "fetch", "other", "image", "font"
-                    }:
-                        route.abort()
-                        return
-                    if time.monotonic() - render_started > 35:
-                        if is_main_frame_navigation(req):
-                            fatal_document_error.append(WebsiteTimeoutError("The webpage exceeded the 35-second render limit."))
-                        route.abort()
-                        return
-                    request_count += 1
-                    if request_count > MAX_RENDER_REQUESTS:
-                        if is_main_frame_navigation(req):
-                            fatal_document_error.append(
-                                WebsiteResourceLimitError("The page requested too many resources.")
-                            )
-                        route.abort()
-                        return
-                    diagnostic = begin_request_diagnostic(req)
+                    reserved = 0
+                    settled = False
+                    fetch_slot_acquired = False
+                    fetch_started = False
+                    diagnostic = None
                     try:
+                        if req.method not in {"GET", "HEAD"} or req.resource_type not in {
+                            "document", "script", "stylesheet", "xhr", "fetch", "other", "image", "font"
+                        }:
+                            await route.abort()
+                            return
+                        if asyncio.get_running_loop().time() >= work_deadline:
+                            if is_main_frame_navigation(req):
+                                fatal_document_error.append(WebsiteTimeoutError(
+                                    "The webpage exceeded the 35-second render limit."
+                                ))
+                            await route.abort()
+                            return
+                        request_count += 1
+                        if request_count > MAX_RENDER_REQUESTS:
+                            if is_main_frame_navigation(req):
+                                fatal_document_error.append(
+                                    WebsiteResourceLimitError("The page requested too many resources.")
+                                )
+                            await route.abort()
+                            return
+                        diagnostic = begin_request_diagnostic(req)
                         resource_limit = (
                             document_limit_bytes if req.is_navigation_request() else 512 * 1024
                         )
-                        body, headers, final_url = fetch_public_resource(
-                            req.url,
-                            accept=req.headers.get("accept", "*/*"),
-                            max_bytes=min(resource_limit, resource_budget - total_bytes),
-                            require_html=req.is_navigation_request(),
-                        )
-                        total_bytes += len(body)
-                        if total_bytes > resource_budget:
-                            raise ValueError("The page exceeded the 8 MB resource limit.")
+                        reserved = await reserve_bytes(resource_limit)
+                        if reserved <= 0:
+                            raise ResourceTooLarge("The page exceeded the 8 MB aggregate resource limit.")
+                        remaining = work_deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+                        await asyncio.wait_for(fetch_slots.acquire(), remaining)
+                        fetch_slot_acquired = True
+                        try:
+                            fetch_started = True
+                            body, headers, final_url = await fetch_public_resource_async(
+                                req.url,
+                                validate_url=validated_http_url,
+                                deadline=work_deadline,
+                                accept=req.headers.get("accept", "*/*"),
+                                max_bytes=reserved,
+                                require_html=req.is_navigation_request(),
+                            )
+                        finally:
+                            fetch_slots.release()
+                            fetch_slot_acquired = False
+                        await settle_bytes(reserved, len(body))
+                        settled = True
                         response_headers = {
                             key: value for key, value in headers.items()
                             if key.lower() in {"content-type", "cache-control"}
@@ -1349,13 +1480,34 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
                                 body,
                                 count=1,
                             )
-                        route.fulfill(status=200, headers=response_headers, body=body)
+                        await route.fulfill(status=200, headers=response_headers, body=body)
                         finish_request_diagnostic(diagnostic, "finished")
+                    except asyncio.CancelledError:
+                        if reserved and not settled:
+                            # A cancelled stream may already have transferred
+                            # bytes that its coroutine cannot report. Charge its
+                            # full reservation so concurrent routes cannot exceed
+                            # the aggregate network-byte ceiling.
+                            await settle_bytes(reserved, reserved if fetch_started else 0)
+                            settled = True
+                        if fetch_slot_acquired:
+                            fetch_slots.release()
+                            fetch_slot_acquired = False
+                        await abort_route(route)
+                        raise
                     except Exception as exc:
-                        finish_request_diagnostic(diagnostic, "failed")
+                        if reserved and not settled:
+                            await settle_bytes(reserved, min(reserved, getattr(exc, "consumed_bytes", 0)))
+                            settled = True
+                        if fetch_slot_acquired:
+                            fetch_slots.release()
+                            fetch_slot_acquired = False
+                        exc = fetch_error_for_app(exc)
+                        if diagnostic:
+                            finish_request_diagnostic(diagnostic, "failed")
                         if is_main_frame_navigation(req):
-                            if isinstance(exc, ValueError) and str(exc) == "The webpage resource is too large to check.":
-                                if resource_budget - total_bytes < document_limit_bytes:
+                            if isinstance(exc, (ResourceTooLarge, ValueError)) and "too large" in str(exc).lower():
+                                if reserved < document_limit_bytes:
                                     exc = WebsiteResourceLimitError(
                                         "The page exceeded the 8 MiB aggregate resource limit while loading its main document."
                                     )
@@ -1365,17 +1517,30 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
                                         f"{max_document_size_kib} KiB per-resource limit."
                                     )
                             fatal_document_error.append(exc)
-                        route.abort()
+                        await abort_route(route)
+                    finally:
+                        active_route_tasks.discard(current_task)
 
-                context.route("**/*", fulfill_safely)
-                page = context.new_page()
+                await context.route("**/*", fulfill_safely)
+                page = await context.new_page()
                 try:
-                    page.goto(start_url, wait_until="domcontentloaded", timeout=25_000)
-                    page.wait_for_timeout(750)
+                    remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
+                    if remaining_ms <= 0:
+                        raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                    async with asyncio.timeout_at(work_deadline):
+                        # `domcontentloaded` can wait for deferred scripts and other
+                        # subresources. Their routes are deliberately fetched by our
+                        # async, validated client, so a slow optional resource must
+                        # not hold the main document hostage. `commit` fires after
+                        # the fulfilled main response is available to Chromium.
+                        await page.goto(start_url, wait_until="commit", timeout=remaining_ms)
+                        await page.wait_for_timeout(min(750, max(0, int(
+                            (work_deadline - asyncio.get_running_loop().time()) * 1000
+                        ))))
                 except PlaywrightTimeoutError as exc:
                     if fatal_document_error:
                         raise fatal_document_error[0] from exc
-                    now = time.monotonic()
+                    now = asyncio.get_running_loop().time()
                     safe_trace = []
                     pending_count = 0
                     for entry in request_trace:
@@ -1391,13 +1556,15 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
                             "elapsed_ms": elapsed,
                         })
                     render_logger.warning(
-                        "navigation_timeout phase=domcontentloaded elapsed_ms=%d routed_requests=%d pending_requests=%d recent_requests=%s",
-                        min(35_000, max(0, int((time.monotonic() - render_started) * 1000))),
+                        "navigation_timeout phase=commit elapsed_ms=%d routed_requests=%d pending_requests=%d recent_requests=%s",
+                        min(35_000, max(0, int((asyncio.get_running_loop().time() - render_started) * 1000))),
                         request_count,
                         pending_count,
                         json.dumps(safe_trace, ensure_ascii=True, separators=(",", ":")),
                     )
                     raise WebsiteTimeoutError("The webpage took too long to render. Try again later.") from exc
+                except asyncio.TimeoutError as exc:
+                    raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.") from exc
                 except Exception as exc:
                     if fatal_document_error:
                         raise fatal_document_error[0] from exc
@@ -1405,38 +1572,68 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
                     raise WebsiteTemporaryError("The webpage could not be rendered. Check the browser installation and try again.") from exc
                 if fatal_document_error:
                     raise fatal_document_error[0]
-                html = page.content()
+                try:
+                    async with asyncio.timeout_at(work_deadline):
+                        html = await page.content()
+                except Exception:
+                    # A client-side navigation can still be in flight after the
+                    # short post-commit settling window. Preserve a server-side
+                    # resource-cap failure instead of replacing it with a generic
+                    # Playwright "page is navigating" error.
+                    if fatal_document_error:
+                        raise fatal_document_error[0]
+                    raise
                 rejection_reason = rejected_page_reason(html)
                 if rejection_reason:
                     if "bot or access challenge" in rejection_reason:
                         raise WebsiteCaptchaError(rejection_reason)
                     raise WebsiteBlockedError(rejection_reason)
-                selector_result = apply_page_selectors(page, selectors or {}, capture_regions=preview)
+                async with asyncio.timeout_at(work_deadline):
+                    selector_result = await apply_page_selectors(
+                        page, selectors or {}, capture_regions=preview,
+                    )
                 if selector_result.get("error"):
                     raise WebsiteSelectorError(selector_result["error"])
-                text = page.locator("body").inner_text(timeout=5000)
+                remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
+                if remaining_ms <= 0:
+                    raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                text = await page.locator("body").inner_text(timeout=min(5000, remaining_ms))
                 if not text:
                     raise ValueError("No readable text was found on this webpage.")
                 screenshot = None
                 numeric_values = []
                 for selector in (selectors or {}).get("numeric", []):
                     try:
-                        observed = page.locator(selector).first.inner_text(timeout=1000).strip()
+                        remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
+                        if remaining_ms <= 0:
+                            raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                        observed = (await page.locator(selector).first.inner_text(
+                            timeout=min(1000, remaining_ms)
+                        )).strip()
                         match = re.search(r"[-+]?\d[\d,]*(?:\.\d+)?", observed)
                         if match:
                             numeric_values.append({"selector": selector, "value": float(match.group(0).replace(",", "")),
                                                    "raw_text": observed[:200]})
                         else:
                             selector_result.setdefault("warnings", []).append(f"No number found for numeric selector: {selector}")
+                    except WebsiteTimeoutError:
+                        raise
                     except Exception:
                         selector_result.setdefault("warnings", []).append(f"Numeric selector is invalid or missing: {selector}")
                 screenshot_error = None
                 try:
-                    image = page.screenshot(type="jpeg", quality=65, full_page=False, timeout=5000)
+                    remaining_ms = int((work_deadline - asyncio.get_running_loop().time()) * 1000)
+                    if remaining_ms <= 0:
+                        raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.")
+                    image = await page.screenshot(
+                        type="jpeg", quality=65, full_page=False, timeout=min(5000, remaining_ms),
+                    )
                     if len(image) <= MAX_SCREENSHOT_BYTES:
                         screenshot = image
                     else:
                         screenshot_error = "The rendered screenshot exceeded the 512 KB storage limit."
+                except WebsiteTimeoutError:
+                    raise
                 except Exception:
                     screenshot_error = "The webpage loaded, but its screenshot could not be captured."
                 return RenderedPageText(
@@ -1446,19 +1643,37 @@ def _render_page_text_with_browser(start_url, selectors=None, preview=False,
                     numeric_values,
                 )
             finally:
-                browser.close()
-    except WebsiteBlockedError:
+                current_task = asyncio.current_task()
+                pending = [task for task in active_route_tasks if task is not current_task and not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    remaining = max(0.001, deadline - asyncio.get_running_loop().time())
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True), remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        render_logger.warning("renderer_cleanup_failure phase=route_tasks deadline_expired=true")
+                if context is not None:
+                    await close_with_deadline(context.close, "context_close")
+                if browser is not None:
+                    await close_with_deadline(browser.close, "browser_close")
+    except (WebsiteBlockedError, WebsiteUnreachableError, WebsiteTemporaryError,
+            WebsiteTimeoutError, WebsiteResourceLimitError, WebsiteSelectorError, ValueError):
         raise
-    except (WebsiteUnreachableError, WebsiteTemporaryError, ValueError):
-        raise
+    except asyncio.TimeoutError as exc:
+        raise WebsiteTimeoutError("The webpage exceeded the 35-second render limit.") from exc
     except Exception as exc:
         log_renderer_exception("browser_session", start_url, exc)
-        raise WebsiteTemporaryError("The webpage could not be rendered. Check the browser installation and try again.") from exc
+        raise WebsiteTemporaryError(
+            "The webpage could not be rendered. Check the browser installation and try again."
+        ) from exc
 
 
-def apply_page_selectors(page, selectors, capture_regions=False):
+async def apply_page_selectors(page, selectors, capture_regions=False):
     """Apply saved include/exclude selectors and optionally list preview regions."""
-    return page.evaluate(
+    return await page.evaluate(
         """({ watched, ignored, captureRegions }) => {
           const warnings = [];
           const query = (selector, kind) => {
