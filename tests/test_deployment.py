@@ -158,7 +158,7 @@ def test_trusted_proxy_autodetection_is_limited_to_platform_port_and_can_be_disa
     assert webwatch.trusted_proxy_enabled({"PORT": "10000", "WEBWATCH_TRUST_PROXY": "false"}) is False
 
 
-def test_gunicorn_configuration_uses_one_worker_and_scheduler_hooks(monkeypatch):
+def test_gunicorn_readiness_does_not_wait_for_playwright_and_starts_scheduler(monkeypatch):
     config_path = Path(__file__).parents[1] / "gunicorn.conf.py"
     config = runpy.run_path(str(config_path))
     assert config["workers"] == 1
@@ -166,8 +166,10 @@ def test_gunicorn_configuration_uses_one_worker_and_scheduler_hooks(monkeypatch)
     assert config["threads"] == 4
 
     starts, stops = [], []
-    checks = []
-    monkeypatch.setattr(webwatch, "verify_playwright_browser", lambda: checks.append(True))
+    monkeypatch.setattr(
+        webwatch, "verify_playwright_browser",
+        lambda: pytest.fail("worker readiness must not block on Playwright verification"),
+    )
     monkeypatch.setattr(webwatch, "start_scheduler", lambda: starts.append(True))
     monkeypatch.setattr(webwatch, "stop_scheduler", lambda: stops.append(True))
     class Worker:
@@ -183,12 +185,10 @@ def test_gunicorn_configuration_uses_one_worker_and_scheduler_hooks(monkeypatch)
     worker = Worker()
     config["post_worker_init"](worker)
     config["worker_exit"](object(), object())
-    assert checks == [True]
     assert starts == [True]
     assert stops == [True]
     assert worker.log.messages == [
-        "WebWatch startup: verifying Playwright browser",
-        "WebWatch startup: Playwright browser verified; starting scheduler",
+        "WebWatch startup: starting scheduler",
         "WebWatch startup: scheduler started; worker initialization complete",
     ]
 
