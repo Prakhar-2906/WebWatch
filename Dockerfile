@@ -22,6 +22,7 @@ COPY . .
 # Flask's default SQLite location must be writable when no database override is set.
 RUN groupadd --system webwatch \
     && useradd --system --gid webwatch --create-home --home-dir /home/webwatch webwatch \
+    && chmod -R a+rX /app \
     && mkdir -p /app/instance \
     && chown -R webwatch:webwatch /app/instance /app/.playwright-browsers
 

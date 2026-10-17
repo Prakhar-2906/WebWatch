@@ -324,6 +324,8 @@ def test_voroa_docker_image_installs_linux_dependencies_in_the_runtime_image():
         "RUN python tools/install_playwright_browser.py"
     )
     assert dockerfile.index("RUN python tools/install_playwright_browser.py") < dockerfile.index("USER webwatch")
+    assert "chmod -R a+rX /app" in dockerfile
+    assert "chown -R webwatch:webwatch /app/instance /app/.playwright-browsers" in dockerfile
     assert "--bind 0.0.0.0:${PORT:-3000}" in dockerfile
     assert "HEALTHCHECK --interval=30s" in dockerfile
     assert "/auth/status" in dockerfile and "authentication_available" in dockerfile
