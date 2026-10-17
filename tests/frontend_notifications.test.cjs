@@ -61,7 +61,7 @@ class MockElement {
   reset() {}
 }
 
-function makeHarness({ permission = 'granted', supported = true, events = [], storage = new Map(), lastRunAt = '2026-01-01T00:00:00Z', sites = [], jobs = [], alertSettings = null, alertSaveError = '', alertTestResponse = { ok: true }, alertTestError = '', csrfStatus = 200, csrfBodyText = null, historyBySite = {}, historyPagesBySite = {}, historyPage404BySite = [], historyPageJson404BySite = [], comparisonsBySite = {}, previewsBySite = {}, metricsBySite = {}, confirmResult = true, extensionHash = '' } = {}) {
+function makeHarness({ permission = 'granted', supported = true, events = [], storage = new Map(), lastRunAt = '2026-01-01T00:00:00Z', sites = [], jobs = [], alertSettings = null, alertSaveError = '', alertTestResponse = { ok: true }, alertTestError = '', csrfStatus = 200, csrfBodyText = null, csrfFetchError = false, historyBySite = {}, historyPagesBySite = {}, historyPage404BySite = [], historyPageJson404BySite = [], comparisonsBySite = {}, previewsBySite = {}, metricsBySite = {}, confirmResult = true, extensionHash = '' } = {}) {
   const elements = new Map();
   function element(selector) {
     if (!elements.has(selector)) elements.set(selector, new MockElement(selector, element));
@@ -136,6 +136,7 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
 
   async function fetch(url, options = {}) {
     requests.push({ url, method: options.method || 'GET' });
+    if (url === '/auth/csrf' && csrfFetchError) throw new Error('simulated network failure');
     let payload;
     let status = 200;
     let bodyText;
@@ -391,6 +392,38 @@ test('token acquisition errors expose HTTP status without exposing response bodi
   assert.match(feedback.textContent, /fresh security token could not be created: HTTP 502/);
   assert.doesNotMatch(feedback.textContent, /upstream failed|<html>|mock-csrf/);
   assert.equal(feedback.dataset.kind, 'error');
+});
+
+test('token acquisition network failures report the failing stage without leaking low-level errors', async () => {
+  const harness = makeHarness({ csrfFetchError: true });
+  await harness.start();
+  await harness.submit('#alert-settings-form');
+
+  const feedback = harness.elements.get('#alert-settings-status');
+  assert.match(feedback.textContent, /Could not reach WebWatch while requesting a fresh security token/);
+  assert.doesNotMatch(feedback.textContent, /simulated network failure|mock-csrf/);
+  assert.equal(feedback.dataset.kind, 'error');
+});
+
+test('Check All gets both website lists, fetches a fresh CSRF token, checks sites, and reloads dashboard data', async () => {
+  const harness = makeHarness({ sites: [
+    { id: 41, url: 'https://news.example/', display_name: 'News', is_demo: false },
+  ] });
+  await harness.start();
+  const initialDashboardRequests = harness.requests.slice();
+  harness.requests.length = 0;
+
+  await harness.click('#check-all');
+
+  assert.ok(harness.requests.some(({ url }) => url === '/api/websites?hidden=false'));
+  assert.equal(harness.requests.filter(({ url }) => url === '/api/websites?hidden=true').length, 1);
+  assert.equal(harness.requests.filter(({ url }) => url === '/auth/csrf').length, 1);
+  assert.deepEqual(harness.requests.filter(({ method, url }) => method === 'POST' && url.startsWith('/api/websites/')), [
+    { url: '/api/websites/41/check', method: 'POST' },
+  ]);
+  assert.ok(harness.requests.some(({ url }) => url === '/api/stats'));
+  assert.ok(initialDashboardRequests.some(({ url }) => url.startsWith('/api/notifications')));
+  assert.match(harness.elements.get('#check-all-status').textContent, /1 successful, 0 changed websites, 0 failed/);
 });
 
 function event(id, eventType) {

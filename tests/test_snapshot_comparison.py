@@ -384,6 +384,51 @@ def test_first_successful_check_saves_baseline(client, tmp_path, monkeypatch):
     assert stored_snapshots(tmp_path / "test-webwatch.sqlite3", website_id) == [("First page text",)]
 
 
+def test_fresh_csrf_authenticated_check_and_dashboard_data_flow(client, monkeypatch):
+    """Exercise the browser's token, owner session, check, and dashboard APIs together."""
+    monkeypatch.setattr(webwatch, "validated_http_url", lambda value: (value, "example.com", {"93.184.216.34"}))
+    results = iter(["First page text", webwatch.WebsiteUnreachableError("Connection refused.")])
+
+    def fake_render(_url):
+        result = next(results)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(webwatch, "render_page_text", fake_render)
+
+    token_response = client.get("/auth/csrf")
+    assert token_response.status_code == 200
+    csrf_token = token_response.get_json()["csrf_token"]
+    assert client.get_cookie("webwatch_csrf").value == csrf_token
+    mutation_headers = {"X-WebWatch-Request": "1", "X-CSRF-Token": csrf_token}
+
+    created = client.post("/api/websites", json={"url": "https://example.com/"}, headers=mutation_headers)
+    assert created.status_code == 201, created.get_json()
+    website_id = created.get_json()["id"]
+
+    first_check = client.post(f"/api/websites/{website_id}/check", headers=mutation_headers)
+    outage_check = client.post(f"/api/websites/{website_id}/check", headers=mutation_headers)
+    assert first_check.status_code == 200
+    assert first_check.get_json()["last_check_status"] == "baseline"
+    assert outage_check.status_code == 502
+    assert outage_check.get_json()["notification"]["event_type"] == "unreachable"
+
+    watchlist = client.get("/api/websites?hidden=false")
+    summary = client.get("/api/stats")
+    events = client.get("/api/notifications?limit=100")
+    assert watchlist.status_code == summary.status_code == events.status_code == 200
+    assert [site["id"] for site in watchlist.get_json()] == [website_id]
+    assert summary.get_json() == {
+        "websites": 1,
+        "successful_checks": 1,
+        "detected_changes": 0,
+        "demo_runs": 0,
+    }
+    assert [event["event_type"] for event in events.get_json()] == ["unreachable"]
+    assert events.headers["X-Total-Count"] == "1"
+
+
 def test_identical_successful_check_reports_no_change_without_duplicate_snapshot(client, tmp_path, monkeypatch):
     monkeypatch.setattr(webwatch, "render_page_text", lambda _url: "Same page text")
     website_id = add_test_website(client)

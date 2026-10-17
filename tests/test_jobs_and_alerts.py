@@ -195,6 +195,11 @@ def test_unexpected_manual_check_failure_is_saved_as_a_visible_result(jobs_clien
 
 def test_same_normalized_render_settings_fetch_once_and_distribute_history(jobs_client, monkeypatch):
     client, database = jobs_client
+    monkeypatch.setattr(
+        webwatch,
+        "validated_http_url",
+        lambda value: (value, "example.com", {"93.184.216.34"}),
+    )
     first_id = add_site(client, "https://EXAMPLE.com/")
     with sqlite3.connect(database) as db:
         db.execute("INSERT INTO websites (url, created_at, display_name, owner_id) VALUES (?, ?, ?, 1)",

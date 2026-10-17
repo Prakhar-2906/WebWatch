@@ -150,7 +150,12 @@ async function api(path, options = {}) {
   const headers = { ...(fetchOptions.body ? { 'Content-Type': 'application/json' } : {}), ...fetchOptions.headers };
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
     headers['X-WebWatch-Request'] = '1';
-    const tokenResponse = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
+    let tokenResponse;
+    try {
+      tokenResponse = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
+    } catch {
+      throw new Error('Could not reach WebWatch while requesting a fresh security token. Check your connection and try again.');
+    }
     const tokenResult = await tokenResponse.json().catch(() => ({}));
     if (!tokenResponse.ok) {
       const reason = tokenResult.error || `HTTP ${tokenResponse.status}`;
