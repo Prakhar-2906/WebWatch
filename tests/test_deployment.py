@@ -320,6 +320,9 @@ def test_voroa_docker_image_installs_linux_dependencies_in_the_runtime_image():
     assert dockerfile.count("\nFROM ") == 0 and dockerfile.startswith("FROM python:3.14.6-slim\n")
     assert "PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers" in dockerfile
     assert "RUN python tools/install_playwright_browser.py" in dockerfile
+    assert dockerfile.index("COPY app.py auth.py async_public_fetch.py ./") < dockerfile.index(
+        "RUN python tools/install_playwright_browser.py"
+    )
     assert dockerfile.index("RUN python tools/install_playwright_browser.py") < dockerfile.index("USER webwatch")
     assert "--bind 0.0.0.0:${PORT:-3000}" in dockerfile
     assert "HEALTHCHECK --interval=30s" in dockerfile

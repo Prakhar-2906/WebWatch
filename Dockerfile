@@ -13,7 +13,7 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 # The installer invokes Playwright's Linux --with-deps flow and verifies the
 # headless-shell executable. This runs in the final image, so both its browser
 # and shared libraries are present when the container starts.
-COPY app.py auth.py ./
+COPY app.py auth.py async_public_fetch.py ./
 COPY tools/install_playwright_browser.py tools/install_playwright_browser.py
 RUN python tools/install_playwright_browser.py
 
