@@ -43,8 +43,13 @@ def test_guest_can_enter_and_use_isolated_monitoring_features(tmp_path, monkeypa
     remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
     assert 5 * 60 * 60 <= remaining <= 6 * 60 * 60
     assert "Secure" in started.headers.get("Set-Cookie", "")
-    assert guest.get("/").status_code == 200
-    assert b"Temporary guest session" in guest.get("/").data
+    dashboard = guest.get("/")
+    assert dashboard.status_code == 200
+    assert b"Temporary guest session" in dashboard.data
+    assert b"Troubleshooting Common Errors" in dashboard.data
+    assert b"WEBWATCH_RENDER_TIMEOUT_SECONDS" in dashboard.data
+    assert b"512 KiB per-resource limit" in dashboard.data
+    assert b"Screenshot unavailable" in dashboard.data
     token = guest.get_cookie(auth.CSRF_COOKIE).value
     assert guest.post("/auth/guest", json={}, headers={"X-CSRF-Token": token}).status_code == 409
 
