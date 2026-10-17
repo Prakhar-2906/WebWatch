@@ -13,8 +13,11 @@ def post_worker_init(worker):
     """Verify the renderer, then start the scheduler in the sole worker."""
     from app import start_scheduler, verify_playwright_browser
 
+    worker.log.info("WebWatch startup: verifying Playwright browser")
     verify_playwright_browser()
+    worker.log.info("WebWatch startup: Playwright browser verified; starting scheduler")
     start_scheduler()
+    worker.log.info("WebWatch startup: scheduler started; worker initialization complete")
 
 
 def worker_exit(server, worker):

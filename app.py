@@ -850,6 +850,7 @@ def login_page():
 @app.get("/healthz")
 def healthcheck():
     """Answer container health probes without auth, database, or network work."""
+    app.logger.info("Health probe reached /healthz")
     return "ok\n", 200, {"Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store"}
 
 

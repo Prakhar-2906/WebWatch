@@ -170,11 +170,27 @@ def test_gunicorn_configuration_uses_one_worker_and_scheduler_hooks(monkeypatch)
     monkeypatch.setattr(webwatch, "verify_playwright_browser", lambda: checks.append(True))
     monkeypatch.setattr(webwatch, "start_scheduler", lambda: starts.append(True))
     monkeypatch.setattr(webwatch, "stop_scheduler", lambda: stops.append(True))
-    config["post_worker_init"](object())
+    class Worker:
+        class Log:
+            def __init__(self):
+                self.messages = []
+
+            def info(self, message):
+                self.messages.append(message)
+
+        log = Log()
+
+    worker = Worker()
+    config["post_worker_init"](worker)
     config["worker_exit"](object(), object())
     assert checks == [True]
     assert starts == [True]
     assert stops == [True]
+    assert worker.log.messages == [
+        "WebWatch startup: verifying Playwright browser",
+        "WebWatch startup: Playwright browser verified; starting scheduler",
+        "WebWatch startup: scheduler started; worker initialization complete",
+    ]
 
 
 def test_playwright_headless_shell_path_matches_chromium_1248_linux_x64(tmp_path):
