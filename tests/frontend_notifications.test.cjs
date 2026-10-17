@@ -61,7 +61,7 @@ class MockElement {
   reset() {}
 }
 
-function makeHarness({ permission = 'granted', supported = true, events = [], storage = new Map(), lastRunAt = '2026-01-01T00:00:00Z', sites = [], jobs = [], alertSettings = null, alertSaveError = '', alertTestResponse = { ok: true }, alertTestError = '', historyBySite = {}, historyPagesBySite = {}, historyPage404BySite = [], historyPageJson404BySite = [], comparisonsBySite = {}, previewsBySite = {}, metricsBySite = {}, confirmResult = true, extensionHash = '' } = {}) {
+function makeHarness({ permission = 'granted', supported = true, events = [], storage = new Map(), lastRunAt = '2026-01-01T00:00:00Z', sites = [], jobs = [], alertSettings = null, alertSaveError = '', alertTestResponse = { ok: true }, alertTestError = '', csrfStatus = 200, csrfBodyText = null, historyBySite = {}, historyPagesBySite = {}, historyPage404BySite = [], historyPageJson404BySite = [], comparisonsBySite = {}, previewsBySite = {}, metricsBySite = {}, confirmResult = true, extensionHash = '' } = {}) {
   const elements = new Map();
   function element(selector) {
     if (!elements.has(selector)) elements.set(selector, new MockElement(selector, element));
@@ -139,7 +139,11 @@ function makeHarness({ permission = 'granted', supported = true, events = [], st
     let payload;
     let status = 200;
     let bodyText;
-    if (url === '/auth/csrf') payload = { ok: true, csrf_token: 'mock-csrf' };
+    if (url === '/auth/csrf') {
+      status = csrfStatus;
+      if (csrfBodyText !== null) bodyText = csrfBodyText;
+      else payload = { ok: true, csrf_token: 'mock-csrf' };
+    }
     else if (url.startsWith('/api/schedule')) payload = scheduleResponse;
     else if (url.startsWith('/api/notifications')) payload = notificationEvents;
     else if (url.startsWith('/api/jobs')) payload = jobs;
@@ -375,6 +379,17 @@ test('alert validation errors never echo the submitted webhook secret', async ()
   const feedback = harness.elements.get('#alert-settings-status');
   assert.doesNotMatch(feedback.textContent, /private-value/);
   assert.match(feedback.textContent, /the supplied webhook URL/);
+  assert.equal(feedback.dataset.kind, 'error');
+});
+
+test('token acquisition errors expose HTTP status without exposing response bodies', async () => {
+  const harness = makeHarness({ csrfStatus: 502, csrfBodyText: '<html>upstream failed</html>' });
+  await harness.start();
+  await harness.submit('#alert-settings-form');
+
+  const feedback = harness.elements.get('#alert-settings-status');
+  assert.match(feedback.textContent, /fresh security token could not be created: HTTP 502/);
+  assert.doesNotMatch(feedback.textContent, /upstream failed|<html>|mock-csrf/);
   assert.equal(feedback.dataset.kind, 'error');
 });
 

@@ -152,9 +152,12 @@ async function api(path, options = {}) {
     headers['X-WebWatch-Request'] = '1';
     const tokenResponse = await fetch('/auth/csrf', { cache: 'no-store', credentials: 'same-origin' });
     const tokenResult = await tokenResponse.json().catch(() => ({}));
-    if (!tokenResponse.ok) throw new Error(tokenResult.error || 'A fresh security token could not be created. Reload the page and try again.');
+    if (!tokenResponse.ok) {
+      const reason = tokenResult.error || `HTTP ${tokenResponse.status}`;
+      throw new Error(`A fresh security token could not be created: ${reason}. Reload the page and try again.`);
+    }
     if (typeof tokenResult.csrf_token !== 'string' || !tokenResult.csrf_token) {
-      throw new Error('A fresh security token could not be created. Reload the page and try again.');
+      throw new Error(`A fresh security token could not be created (HTTP ${tokenResponse.status}; response contained no token). Reload the page and try again.`);
     }
     headers['X-CSRF-Token'] = tokenResult.csrf_token;
   }
