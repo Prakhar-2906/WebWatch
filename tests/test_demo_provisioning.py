@@ -47,6 +47,9 @@ def test_demo_account_provisioning_is_hashed_idempotent_and_uses_selected_databa
     client = webwatch.app.test_client()
     sign_in = client.get("/login")
     assert b"Demo sign-in is available only when the service operator has configured" in sign_in.data
+    assert DEMO_EMAIL.encode() not in sign_in.data
+    assert b"Demo Credentials" not in sign_in.data
+    assert b"test000" not in sign_in.data
     assert demo_password.encode() not in sign_in.data
     prepare_test_client(client)
     response = client.post("/auth/login", json={"email": DEMO_EMAIL, "password": demo_password},

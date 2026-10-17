@@ -45,7 +45,7 @@ def test_guest_can_enter_and_use_isolated_monitoring_features(tmp_path, monkeypa
     assert "Secure" in started.headers.get("Set-Cookie", "")
     dashboard = guest.get("/")
     assert dashboard.status_code == 200
-    assert b"Temporary guest session" in dashboard.data
+    assert b"Guest access has limited features" in dashboard.data
     assert b"Troubleshooting Common Errors" in dashboard.data
     assert b"WEBWATCH_RENDER_TIMEOUT_SECONDS" in dashboard.data
     assert b"512 KiB per-resource limit" in dashboard.data
@@ -88,7 +88,10 @@ def test_guest_dashboard_explains_account_only_schedule_and_webhook_options(tmp_
     page = guest.get("/")
 
     assert page.status_code == 200
-    assert b"Automatic checks and alert settings are only available to signed-in accounts." in page.data
+    assert b"Guest access has limited features" in page.data
+    assert b"monitor up to five websites" in page.data
+    assert b"data is deleted after this session expires" in page.data
+    assert b"Automatic checks and webhook alerts are only available to signed-in accounts." in page.data
     assert b'href="#schedule-heading"' not in page.data
     assert b'href="#alerts-heading"' not in page.data
     assert b'aria-labelledby="schedule-heading" hidden' in page.data
